@@ -10,12 +10,7 @@ Code et README générés par IA.
 
 * 💡 **Éclairage**
 
-  * Canapé
-  * Dîner
-  * Extinction salon/cuisine
-  * Entrée
-  * Kino
-  * Veilleuse
+  * Commande de différentes scènes lumineuses : Canapé, Dîner, Film, ..., tout éteint.
 * 🏠 **Modes**
 
   * Annonce audio
@@ -29,8 +24,7 @@ Code et README générés par IA.
 
   * Chauffage / Clim / Off
   * Réglage de la température
-  * Température actuelle
-  * Humidité
+  * Température/humidité actuelle
 
 ### Page 2 — Volets & Wi-Fi
 
