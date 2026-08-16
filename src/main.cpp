@@ -8,6 +8,8 @@
 
 #include "SpaceMono26.h"
 #include "SpaceMono42.h"
+// NB: SpaceMono36.h a été retiré car aucun display.loadFont(SpaceMono36) n'apparaît
+// dans ce fichier. Remets-le si tu l'utilises ailleurs dans le projet.
 
 M5GFX display;
 
@@ -102,6 +104,7 @@ constexpr int COVER_COUNT=2;
 
 struct CoversBlock { Rect bounds; int titleHeight,selectHeight,buttonsHeight; } coversBlock;
 int selectedCover=0;   // index du volet actuellement piloté
+bool page2DataLoaded=false; // Volets/Voucher Wi-Fi ne sont chargés qu'au premier affichage de la page 2
 
 // ---------- Climatisation ----------
 // Mode de fonctionnement affiché/piloté : Chauffage / Clim / Off
@@ -593,6 +596,80 @@ void refreshVoucher(){
   }
 }
 
+// Appelle l'API template de Home Assistant (POST /api/template) : le template
+// Jinja2 est évalué côté serveur et DOIT renvoyer du JSON valide en texte.
+// Permet de récupérer plusieurs entités en UNE SEULE requête HTTP au lieu
+// d'une requête par entité (voir refreshStartupData ci-dessous).
+bool haTemplate(const String& templateStr,DynamicJsonDocument& responseDoc){
+  if(WiFi.status()!=WL_CONNECTED)return false;
+  HTTPClient http;
+  http.begin(String(HA_HOST)+"/api/template");
+  http.addHeader("Authorization",String("Bearer ")+HA_TOKEN);
+  http.addHeader("Content-Type","application/json");
+
+  // On passe par ArduinoJson pour construire le corps de la requête : ça échappe
+  // automatiquement les guillemets/retours à la ligne présents dans templateStr.
+  DynamicJsonDocument requestDoc(templateStr.length()+64);
+  requestDoc["template"]=templateStr;
+  String requestBody;
+  serializeJson(requestDoc,requestBody);
+
+  int httpStatusCode=http.POST(requestBody);
+  bool success=false;
+  if(httpStatusCode==200) success=deserializeJson(responseDoc,http.getString())==DeserializationError::Ok;
+  http.end();
+  return success;
+}
+
+// Récupère en un seul appel HTTP tout ce qu'il faut pour dessiner la page 1 au
+// démarrage : climatisation, température/humidité intérieure et extérieure,
+// état des 3 "Modes", et Spotify. Remplace ~9 requêtes séquentielles par 1 seule.
+// NB: si tu modifies les entités ci-dessous, vérifie le rendu du template dans
+// Home Assistant (Outils de développement > Modèle) avant de faire confiance au résultat.
+void refreshStartupData(){
+  String jinjaTemplate =
+    String("{")
+    + "\"hvac_mode\":{{ states('" + ENTITY_CLIMATE + "') | tojson }},"
+    + "\"target_temp\":{{ state_attr('" + ENTITY_CLIMATE + "','temperature') | float(0) }},"
+    + "\"indoor_temp\":{{ states('" + ENTITY_TEMP + "') | float(0) }},"
+    + "\"indoor_humidity\":{{ states('" + ENTITY_HUMIDITY + "') | float(0) }},"
+    + "\"outdoor_temp\":{{ states('" + ENTITY_OUTDOOR_TEMP + "') | float(0) }},"
+    + "\"outdoor_humidity\":{{ states('" + ENTITY_OUTDOOR_HUMIDITY + "') | float(0) }},"
+    + "\"bus_on\":{{ (states('" + modes.entity[0] + "')=='on') | tojson }},"
+    + "\"absence_on\":{{ (states('" + modes.entity[1] + "')=='on') | tojson }},"
+    + "\"sunshield_on\":{{ (states('" + modes.entity[2] + "')=='on') | tojson }},"
+    + "\"spotify_state\":{{ states('" + ENTITY_SPOTIFY + "') | tojson }},"
+    + "\"spotify_title\":{{ state_attr('" + ENTITY_SPOTIFY + "','media_title') | default('',true) | tojson }},"
+    + "\"spotify_artist\":{{ state_attr('" + ENTITY_SPOTIFY + "','media_artist') | default('',true) | tojson }}"
+    + "}";
+
+  DynamicJsonDocument startupDoc(1024);
+  if(!haTemplate(jinjaTemplate,startupDoc)){
+    // Repli : si l'appel groupé échoue (template refusé, etc.), on retombe
+    // sur les requêtes individuelles habituelles - plus lent mais fiable.
+    refreshClimate();
+    refreshAction(modes);
+    refreshSpotify();
+    return;
+  }
+
+  hvacMode=startupDoc["hvac_mode"].as<String>(); hasTarget=true;
+  targetTemp=startupDoc["target_temp"].as<float>();
+  currentTemp=startupDoc["indoor_temp"].as<float>(); hasCurrent=true;
+  currentHumidity=startupDoc["indoor_humidity"].as<float>(); hasHumidity=true;
+  outdoorTemp=startupDoc["outdoor_temp"].as<float>(); hasOutdoorTemp=true;
+  outdoorHumidity=startupDoc["outdoor_humidity"].as<float>(); hasOutdoorHumidity=true;
+
+  modes.active[0]=startupDoc["bus_on"].as<bool>();
+  modes.active[1]=startupDoc["absence_on"].as<bool>();
+  modes.active[2]=startupDoc["sunshield_on"].as<bool>();
+
+  spotifyState=startupDoc["spotify_state"].as<String>();
+  spotifyTitle=startupDoc["spotify_title"].as<String>();
+  spotifyArtist=startupDoc["spotify_artist"].as<String>();
+  hasSpotify=(spotifyTitle.length()>0 || spotifyArtist.length()>0);
+}
+
 void connectWifi(){
   showStatus("Connexion Wi-Fi...");
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
@@ -634,7 +711,15 @@ void changePage(int delta){
   if(currentPage<1)currentPage=2;
   if(currentPage>2)currentPage=1;
   resetActivityTimer();
-  if(currentPage==1) refreshSpotify();
+  if(currentPage==1){
+    refreshSpotify();
+  }else if(currentPage==2 && !page2DataLoaded){
+    // Volets et voucher Wi-Fi : chargés seulement au premier passage sur la
+    // page 2, pas au démarrage (on ne charge pas ce qui n'est pas affiché).
+    for(auto &coverCard:covers)refreshCover(coverCard);
+    refreshVoucher();
+    page2DataLoaded=true;
+  }
   drawPage();
 }
 
@@ -767,7 +852,7 @@ bool touchSpotify(int touchX,int touchY){
   const char* service = pressedIndex==0 ? "media_previous_track" :
                         pressedIndex==1 ? "media_play_pause" :
                                "media_next_track";
-  const char* label = pressedIndex==0 ? "Spotify : précedent..." :
+  const char* label = pressedIndex==0 ? "Spotify : precedent..." :
                       pressedIndex==1 ? "Spotify : pause/lecture..." :
                              "Spotify : suivant...";
   showStatus(label);
@@ -788,7 +873,7 @@ bool touchWifi(int touchX,int touchY){
   int buttonTop=wifiCard.bounds.y+wifiCard.titleHeight;
   if(touchY<buttonTop)return false;
   display.startWrite();drawWifi(true);display.endWrite();
-  showStatus("Creation voucher Wi-Fi...");
+  showStatus("Creation voucher Wifi...");
   bool ok=haCall("input_button","press",ENTITY_WIFI_BUTTON);
   if(ok){delay(2000);refreshVoucher();showStatus(hasVoucher?("Code : "+voucherCode).c_str():"Code introuvable");}
   else showStatus("Erreur commande HA");
@@ -798,13 +883,37 @@ bool touchWifi(int touchX,int touchY){
 // ---------- Setup / Loop ----------
 void setup(){
   Serial.begin(115200);
-  display.loadFont(SpaceMono26);
   pinMode(PIN_BUTTON_PREV,INPUT_PULLUP); pinMode(PIN_BUTTON_NEXT,INPUT_PULLUP);
+
+  // L'écran doit être initialisé (begin) avant de charger une police dessus.
   display.begin();display.setRotation(0);display.setEpdMode(epd_mode_t::epd_fastest);
-  setupLayout();connectWifi();refreshClimate();
-  for(auto actionCard:actionCards)refreshAction(*actionCard);
-  for(auto &coverCard:covers)refreshCover(coverCard);
-  refreshVoucher();refreshSpotify();resetActivityTimer();drawPage();
+  display.loadFont(SpaceMono26);
+
+  setupLayout();
+  resetActivityTimer();
+
+  // Affichage immédiat avec les valeurs par défaut ("--", OFF...) : l'écran
+  // devient utilisable tout de suite, sans attendre la connexion Wi-Fi ni HA.
+  drawPage();
+
+  WiFi.setSleep(false); // pas de power-save Wi-Fi : connexions/requêtes plus rapides
+  connectWifi();
+
+  // Un seul appel HTTP groupé pour toute la page 1 (climatisation, intérieur/
+  // extérieur, modes, Spotify), au lieu d'une dizaine de requêtes séquentielles.
+  refreshStartupData();
+
+  // Volets et voucher Wi-Fi (page 2) : chargés seulement au premier affichage
+  // de cette page, voir changePage().
+
+  // Redessine seulement les cartes concernées (pas d'effacement plein écran,
+  // cleanScreen() a déjà eu lieu dans le drawPage() ci-dessus).
+  display.startWrite();
+  for(auto actionCard:actionCards)drawAction(*actionCard);
+  drawSpotify();
+  drawClimate();
+  display.endWrite();
+  showStatus(currentPage==1?"Page 1/2":"Page 2/2");
 }
 
 void loop(){
