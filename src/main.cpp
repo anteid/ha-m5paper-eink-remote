@@ -8,8 +8,6 @@
 
 #include "SpaceMono26.h"
 #include "SpaceMono42.h"
-// NB: SpaceMono36.h a été retiré car aucun display.loadFont(SpaceMono36) n'apparaît
-// dans ce fichier. Remets-le si tu l'utilises ailleurs dans le projet.
 
 M5GFX display;
 
