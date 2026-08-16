@@ -7,24 +7,26 @@
 #include "secrets.h"
 
 #include "SpaceMono26.h"
-#include "SpaceMono36.h"
+#include "SpaceMono42.h"
+// NB: SpaceMono36.h a été retiré car aucun display.loadFont(SpaceMono36) n'apparaît
+// dans ce fichier. Remets-le si tu l'utilises ailleurs dans le projet.
 
 M5GFX display;
 
 // ---------- Boutons de page ----------
-constexpr gpio_num_t G37 = GPIO_NUM_37;   // page précédente
-constexpr gpio_num_t G39 = GPIO_NUM_39;   // page suivante
-constexpr uint32_t BTN_DEBOUNCE_MS = 250;
+constexpr gpio_num_t PIN_BUTTON_PREV = GPIO_NUM_37;   // page précédente
+constexpr gpio_num_t PIN_BUTTON_NEXT = GPIO_NUM_39;   // page suivante
+constexpr uint32_t BUTTON_DEBOUNCE_MS = 250;
 
-int page = 1;
-unsigned long lastButton = 0, lastActivity = 0;
+int currentPage = 1;
+unsigned long lastButtonPressTime = 0, lastActivityTime = 0;
 void resetActivityTimer();
 
 // ---------- Deep sleep ----------
 constexpr bool DEEPSLEEP_ENABLED = true;
 constexpr uint32_t DEEPSLEEP_TIMEOUT_MS = 60000;
-constexpr gpio_num_t TOUCH_INT = GPIO_NUM_36;
-constexpr gpio_num_t MAIN_PWR  = GPIO_NUM_2;
+constexpr gpio_num_t PIN_TOUCH_INTERRUPT = GPIO_NUM_36;
+constexpr gpio_num_t PIN_MAIN_POWER      = GPIO_NUM_2;
 
 // ---------- Home Assistant ----------
 const char* ENTITY_CLIMATE  = "climate.clim";
@@ -36,10 +38,11 @@ const char* ENTITY_WIFI_BUTTON = "input_button.creer_voucher";
 const char* ENTITY_WIFI_SENSOR = "sensor.liste_hotspot_vouchers";
 
 // ---------- Géométrie ----------
+// Un Rect decrit un rectangle a l'ecran : coin haut-gauche (x,y) + largeur/hauteur (w,h).
 struct Rect { int x,y,w,h; };
-bool inRect(const Rect& r,int x,int y){return x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h;}
+bool inRect(const Rect& rect,int x,int y){return x>=rect.x&&x<=rect.x+rect.w&&y>=rect.y&&y<=rect.y+rect.h;}
 
-constexpr int R=0, BT=2, LT=2; // radius, border thickness, line thickness
+constexpr int CORNER_RADIUS=0, BORDER_THICKNESS=2, LINE_THICKNESS=2;
 
 // ---------- Hauteur des lignes ----------
 constexpr int LINE_SMALL  = 40;
@@ -47,17 +50,17 @@ constexpr int LINE_MEDIUM = 80;
 constexpr int LINE_LARGE  = 100;
 
 // ---------- Actions ----------
-constexpr int N6=6, N3=3;
+constexpr int MAX_BUTTONS_PER_CARD = 6; // nb max de boutons dans une carte Actions (Eclairage/Modes)
 struct ActionCard {
   const char* title;
-  const char* domain[N6];
-  const char* service[N6];
-  const char* entity[N6];
-  const char* label[N6];
-  const char* state[N6];
-  bool active[N6];
-  Rect r;
-  int titleH, buttonsH, cellW;
+  const char* domain[MAX_BUTTONS_PER_CARD];
+  const char* service[MAX_BUTTONS_PER_CARD];
+  const char* entity[MAX_BUTTONS_PER_CARD];
+  const char* label[MAX_BUTTONS_PER_CARD];
+  const char* state[MAX_BUTTONS_PER_CARD];
+  bool active[MAX_BUTTONS_PER_CARD];
+  Rect bounds;
+  int titleHeight, buttonsHeight, cellWidth;
 };
 
 ActionCard lighting={
@@ -81,12 +84,13 @@ ActionCard modes={
    "automation.fermeture_automatique_volets",nullptr,nullptr,nullptr}
 };
 
-ActionCard* actions[]={&lighting,&modes};
-constexpr int ACTION_COUNT=2;
+// Toutes les cartes "Actions" de la page 1, utilisées dans les boucles génériques
+// (setupLayout, drawPage, refreshAction, touchAction).
+ActionCard* actionCards[]={&lighting,&modes};
 
 // ---------- Volets ----------
-// Une seule ligne de commandes (monter/stop/descendre), partagee entre volets.
-// Une ligne de selection permet de choisir quel volet elle pilote.
+// Une seule ligne de commandes (monter/stop/descendre), partagée entre volets.
+// Une ligne de sélection permet de choisir quel volet elle pilote.
 struct CoverCard {
   const char* title;
   const char* entity;
@@ -98,7 +102,7 @@ CoverCard covers[]={
 };
 constexpr int COVER_COUNT=2;
 
-struct CoversBlock { Rect r; int titleH,selectH,buttonsH; } coversBlock;
+struct CoversBlock { Rect bounds; int titleHeight,selectHeight,buttonsHeight; } coversBlock;
 int selectedCover=0;   // index du volet actuellement piloté
 
 // ---------- Climatisation ----------
@@ -110,7 +114,10 @@ constexpr float TEMP_MAX  = 30.0f;
 const char* HVAC_LABELS[3] = {"CHAUFFAGE","CLIM","OFF"};
 const char* HVAC_MODES[3]  = {"heat","cool","off"};
 
-struct ClimateCard { Rect r; int titleH,modeH,tempH,infoH,infoH2,cellW; } climate;
+struct ClimateCard {
+  Rect bounds;
+  int titleHeight,modeHeight,tempHeight,indoorInfoHeight,outdoorInfoHeight,cellWidth;
+} climate;
 String hvacMode="off";
 bool hasTarget=false, hasCurrent=false, hasHumidity=false;
 float targetTemp=20.0f, currentTemp=0, currentHumidity=0;
@@ -118,414 +125,390 @@ bool hasOutdoorTemp=false, hasOutdoorHumidity=false;
 float outdoorTemp=0, outdoorHumidity=0;
 
 // ---------- Wi-Fi ----------
-struct WifiCard { Rect r; int titleH,buttonH,passwordH,codeH; } wifiCard;
+struct WifiCard { Rect bounds; int titleHeight,buttonHeight,passwordHeight,codeHeight; } wifiCard;
 String voucherCode="";
 bool hasVoucher=false;
 
 // ---------- Spotify ----------
-struct SpotifyCard { Rect r; int titleH,infoH,buttonsH; } spotifyCard;
+struct SpotifyCard { Rect bounds; int titleHeight,infoHeight,buttonsHeight; } spotifyCard;
 String spotifyTitle="";
 String spotifyArtist="";
 String spotifyState="";
 bool hasSpotify=false;
 
-// ---------- Dessin ----------
-void thickRound(int x,int y,int w,int h,int rad,uint32_t c,int t){
-  for(int i=0;i<t;i++) display.drawRoundRect(x+i,y+i,w-2*i,h-2*i,max(0,rad-i),c);
+// ---------- Dessin : primitives de base ----------
+void drawThickRoundedRect(int x,int y,int width,int height,int radius,uint32_t color,int thickness){
+  for(int i=0;i<thickness;i++) display.drawRoundRect(x+i,y+i,width-2*i,height-2*i,max(0,radius-i),color);
 }
-void hline(int x,int y,int w,uint32_t c,int t){display.fillRect(x,y-t/2,w,t,c);}
-void vline(int x,int y,int h,uint32_t c,int t){display.fillRect(x-t/2,y,t,h,c);}
-void arrowUp(int x,int y,int s,uint32_t c){display.fillTriangle(x,y-s,x-s,y+s,x+s,y+s,c);}
-void arrowDown(int x,int y,int s,uint32_t c){display.fillTriangle(x,y+s,x-s,y-s,x+s,y-s,c);}
-void stopIcon(int x,int y,int s,uint32_t c){display.fillRect(x-s,y-s,2*s,2*s,c);}
-void prevIcon(int x,int y,int s,uint32_t c){
-  display.fillRect(x-s,y-s,s/3,2*s,c);
-  display.fillTriangle(x+s,y-s,x-s/3,y,x+s,y+s,c);
+void drawHorizontalLine(int x,int y,int width,uint32_t color,int thickness){display.fillRect(x,y-thickness/2,width,thickness,color);}
+void drawVerticalLine(int x,int y,int height,uint32_t color,int thickness){display.fillRect(x-thickness/2,y,thickness,height,color);}
+
+// ---------- Dessin : icônes ----------
+void drawStopIcon(int centerX,int centerY,int size,uint32_t color){
+  display.fillRect(centerX-size,centerY-size,2*size,2*size,color);
 }
-void nextIcon(int x,int y,int s,uint32_t c){
-  display.fillRect(x+s-s/3,y-s,s/3,2*s,c);
-  display.fillTriangle(x-s,y-s,x+s/3,y,x-s,y+s,c);
+void drawPreviousIcon(int centerX,int centerY,int size,uint32_t color){
+  display.fillRect(centerX-size,centerY-size,size/3,2*size,color);
+  display.fillTriangle(centerX+size,centerY-size,centerX-size/3,centerY,centerX+size,centerY+size,color);
 }
-void pauseIcon(int x,int y,int s,uint32_t c){
-  int w=max(2,s/3);
-  display.fillRect(x-s/2,y-s,w,2*s,c);
-  display.fillRect(x+s/2-w,y-s,w,2*s,c);
+void drawNextIcon(int centerX,int centerY,int size,uint32_t color){
+  display.fillRect(centerX+size-size/3,centerY-size,size/3,2*size,color);
+  display.fillTriangle(centerX-size,centerY-size,centerX+size/3,centerY,centerX-size,centerY+size,color);
+}
+void drawPauseIcon(int centerX,int centerY,int size,uint32_t color){
+  int barWidth=max(2,size/3);
+  display.fillRect(centerX-size/2,centerY-size,barWidth,2*size,color);
+  display.fillRect(centerX+size/2-barWidth,centerY-size,barWidth,2*size,color);
 }
 
-// Ligne ondulee (volute de chaleur), tracee par segments successifs.
-// topY/botY : etendue verticale ; amp : amplitude horizontale de l'ondulation.
-void heatWave(int cx,int topY,int botY,int amp,uint32_t c){
-  const int N=6;
-  int px=cx,py=topY;
-  for(int i=1;i<=N;i++){
-    float t=(float)i/N;
-    int x=cx+(int)(amp*sinf(t*6.9f));      // ~2 ondulations sur la hauteur
-    int y=topY+(int)(t*(botY-topY));
-    display.drawLine(px,py,x,y,c);
-    display.drawLine(px+1,py,x+1,y,c);     // epaississement
-    px=x;py=y;
+// Ligne ondulée (volute de chaleur), tracée par segments successifs.
+// topY/bottomY : étendue verticale ; amplitude : amplitude horizontale de l'ondulation.
+void drawHeatWaveSegment(int centerX,int topY,int bottomY,int amplitude,uint32_t color){
+  const int SEGMENT_COUNT=12;
+  int previousX=centerX,previousY=topY;
+  for(int i=1;i<=SEGMENT_COUNT;i++){
+    float progress=(float)i/SEGMENT_COUNT;
+    int x=centerX+(int)(amplitude*sinf(progress*6.9f));      // ~2 ondulations sur la hauteur
+    int y=topY+(int)(progress*(bottomY-topY));
+    display.drawLine(previousX,previousY,x,y,color);
+    display.drawLine(previousX+1,previousY,x+1,y,color);     // épaississement
+    previousX=x;previousY=y;
   }
 }
 
-// Icone chauffage : basee sur le pictogramme "surface chaude"
-// (barre horizontale + 3 volutes de chaleur qui s'en elevent).
-void heatingIcon(int cx,int cy,int s,uint32_t c){
-  int barY=cy+(int)(s*0.85f);
-  display.fillRect(cx-(int)(s*0.8f),barY,(int)(s*1.6f),(int)(s*0.22f),c);
-  int botY=barY-(int)(s*0.15f), topY=cy-(int)(s*1.0f);
-  int amp=(int)(s*0.22f);
-  heatWave(cx-(int)(s*0.55f),topY,botY,amp,c);
-  heatWave(cx,               topY,botY,amp,c);
-  heatWave(cx+(int)(s*0.55f),topY,botY,amp,c);
+// Icône chauffage : basée sur le pictogramme "surface chaude"
+// (barre horizontale + 3 volutes de chaleur qui s'en élèvent).
+void drawHeatingIcon(int centerX,int centerY,int size,uint32_t color){
+  int barY=centerY+(int)(size*0.85f);
+  display.fillRect(centerX-(int)(size*0.8f),barY,(int)(size*1.6f),(int)(size*0.22f),color);
+  int bottomY=barY-(int)(size*0.15f), topY=centerY-(int)(size*1.0f);
+  int amplitude=(int)(size*0.22f);
+  drawHeatWaveSegment(centerX-(int)(size*0.55f),topY,bottomY,amplitude,color);
+  drawHeatWaveSegment(centerX,               topY,bottomY,amplitude,color);
+  drawHeatWaveSegment(centerX+(int)(size*0.55f),topY,bottomY,amplitude,color);
 }
 
-// Icone clim : flocon hexagonal (3 axes) avec ramifications sur chaque branche.
-void snowIcon(int cx,int cy,int s,uint32_t c){
-  for(int k=0;k<3;k++){
-    float a=k*PI/3.0f, ux=cosf(a), uy=sinf(a);
-    display.drawLine(cx-ux*s,   cy-uy*s,   cx+ux*s,   cy+uy*s,   c);
-    display.drawLine(cx-ux*s,   cy-uy*s+1, cx+ux*s,   cy+uy*s+1, c);
-    for(int sg=-1;sg<=1;sg+=2){
-      float px=cx+ux*s*0.55f*sg, py=cy+uy*s*0.55f*sg;
-      for(int sd=-1;sd<=1;sd+=2){
-        float ba=a+sd*(PI/3.0f);
-        display.drawLine(px,py,px+cosf(ba)*s*0.32f*sg,py+sinf(ba)*s*0.32f*sg,c);
+// Icône clim : flocon hexagonal (3 axes) avec ramifications sur chaque branche.
+void drawSnowflakeIcon(int centerX,int centerY,int size,uint32_t color){
+  for(int axis=0;axis<3;axis++){
+    float angle=axis*PI/3.0f, dx=cosf(angle), dy=sinf(angle);
+    display.drawLine(centerX-dx*size,   centerY-dy*size,   centerX+dx*size,   centerY+dy*size,   color);
+    display.drawLine(centerX-dx*size,   centerY-dy*size+1, centerX+dx*size,   centerY+dy*size+1, color);
+    for(int side=-1;side<=1;side+=2){
+      float branchX=centerX+dx*size*0.55f*side, branchY=centerY+dy*size*0.55f*side;
+      for(int direction=-1;direction<=1;direction+=2){
+        float branchAngle=angle+direction*(PI/3.0f);
+        display.drawLine(branchX,branchY,
+                          branchX+cosf(branchAngle)*size*0.32f*side,
+                          branchY+sinf(branchAngle)*size*0.32f*side,color);
       }
     }
   }
 }
 
-void cardFrame(const Rect& r,const char* title,int titleH){
-  display.fillRoundRect(r.x,r.y,r.w,r.h,R,TFT_WHITE);
+// ---------- Dessin : cadre commun à toutes les cartes ----------
+void drawCardFrame(const Rect& bounds,const char* title,int titleHeight){
+  display.fillRoundRect(bounds.x,bounds.y,bounds.w,bounds.h,CORNER_RADIUS,TFT_WHITE);
   display.setTextDatum(middle_center);
   display.setTextColor(TFT_BLACK,TFT_WHITE);
   display.setTextSize(1);
-  display.drawString(title,r.x+r.w/2,r.y+titleH/2);
-  hline(r.x,r.y+titleH,r.w,TFT_BLACK,LT);
+  display.drawString(title,bounds.x+bounds.w/2,bounds.y+titleHeight/2);
+  drawHorizontalLine(bounds.x,bounds.y+titleHeight,bounds.w,TFT_BLACK,LINE_THICKNESS);
 }
 
-void drawThree(const Rect& r,const char* title,int titleH,int bh,int pressed,
-               const bool* active,const char* labels[3],bool icons){
-  cardFrame(r,title,titleH);
-  int cw=r.w/3, y=r.y+titleH;
+// Carte générique à 3 boutons de texte côte à côte (utilisée pour "Modes").
+void drawThreeButtonCard(const Rect& bounds,const char* title,int titleHeight,int buttonsHeight,
+                          int pressedIndex,const bool* activeStates,const char* labels[3]){
+  drawCardFrame(bounds,title,titleHeight);
+  int cellWidth=bounds.w/3, rowY=bounds.y+titleHeight;
   for(int i=0;i<3;i++){
-    bool hi=(i==pressed)||(active&&active[i]);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=r.x+i*cw,cx=x+cw/2,cy=y+bh/2;
-    display.fillRect(x,y,cw,bh,bg);
-    if(icons){
-      int s=min(cw,bh)/4;
-      if(i==0) arrowUp(cx,cy,s,fg);
-      else if(i==1) stopIcon(cx,cy,(int)(s*.8),fg);
-      else arrowDown(cx,cy,s,fg);
-    }else{
-      display.setTextColor(fg,bg); display.setTextSize(1);
-      display.drawString(labels[i],cx,cy);
-    }
+    bool isHighlighted=(i==pressedIndex)||(activeStates&&activeStates[i]);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=bounds.x+i*cellWidth,centerX=cellX+cellWidth/2,centerY=rowY+buttonsHeight/2;
+    display.fillRect(cellX,rowY,cellWidth,buttonsHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1);
+    display.drawString(labels[i],centerX,centerY);
   }
-  vline(r.x+cw,y,bh,TFT_BLACK,LT); vline(r.x+2*cw,y,bh,TFT_BLACK,LT);
-  thickRound(r.x,r.y,r.w,r.h,R,TFT_BLACK,BT);
+  drawVerticalLine(bounds.x+cellWidth,rowY,buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(bounds.x+2*cellWidth,rowY,buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawThickRoundedRect(bounds.x,bounds.y,bounds.w,bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
-void drawLighting(ActionCard& a,int pressed=-1){
-  cardFrame(a.r,a.title,a.titleH);
-  int cw=a.r.w/3,rh=a.buttonsH/2,y=a.r.y+a.titleH;
+// Carte "Eclairage" : grille de 6 boutons (3 colonnes x 2 lignes).
+void drawLightingCard(ActionCard& actionCard,int pressedIndex=-1){
+  drawCardFrame(actionCard.bounds,actionCard.title,actionCard.titleHeight);
+  int cellWidth=actionCard.bounds.w/3, rowHeight=actionCard.buttonsHeight/2, gridTop=actionCard.bounds.y+actionCard.titleHeight;
   for(int i=0;i<6;i++){
-    int row=i/3,col=i%3,x=a.r.x+col*cw,yy=y+row*rh;
-    bool hi=(i==pressed)||a.active[i];
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE,fg=hi?TFT_WHITE:TFT_BLACK;
-    display.fillRect(x,yy,cw,rh,bg);
-    display.setTextColor(fg,bg); display.setTextSize(1);
-    display.drawString(a.label[i],x+cw/2,yy+rh/2);
+    int row=i/3, col=i%3;
+    int cellX=actionCard.bounds.x+col*cellWidth, cellY=gridTop+row*rowHeight;
+    bool isHighlighted=(i==pressedIndex)||actionCard.active[i];
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    display.fillRect(cellX,cellY,cellWidth,rowHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1);
+    display.drawString(actionCard.label[i],cellX+cellWidth/2,cellY+rowHeight/2);
   }
-  vline(a.r.x+cw,y,a.buttonsH,TFT_BLACK,LT);
-  vline(a.r.x+2*cw,y,a.buttonsH,TFT_BLACK,LT);
-  hline(a.r.x,y+rh,a.r.w,TFT_BLACK,LT);
-  thickRound(a.r.x,a.r.y,a.r.w,a.r.h,R,TFT_BLACK,BT);
+  drawVerticalLine(actionCard.bounds.x+cellWidth,gridTop,actionCard.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(actionCard.bounds.x+2*cellWidth,gridTop,actionCard.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawHorizontalLine(actionCard.bounds.x,gridTop+rowHeight,actionCard.bounds.w,TFT_BLACK,LINE_THICKNESS);
+  drawThickRoundedRect(actionCard.bounds.x,actionCard.bounds.y,actionCard.bounds.w,actionCard.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
-void drawAction(ActionCard& a,int pressed=-1){
-  if(&a==&lighting) drawLighting(a,pressed);
-  else drawThree(a.r,a.title,a.titleH,a.buttonsH,pressed,a.active,a.label,false);
+void drawAction(ActionCard& actionCard,int pressedIndex=-1){
+  if(&actionCard==&lighting) drawLightingCard(actionCard,pressedIndex);
+  else drawThreeButtonCard(actionCard.bounds,actionCard.title,actionCard.titleHeight,actionCard.buttonsHeight,
+                            pressedIndex,actionCard.active,actionCard.label);
 }
 
-// pressedSel : bouton de selection en cours d'appui (-1 = aucun)
-// pressedBtn : bouton monter/stop/descendre en cours d'appui (-1 = aucun)
-void drawCovers(int pressedSel=-1,int pressedBtn=-1){
-  cardFrame(coversBlock.r,"Volets",coversBlock.titleH);
-  int selCw=coversBlock.r.w/COVER_COUNT;
-  int y=coversBlock.r.y+coversBlock.titleH;
+// pressedSelector : bouton de sélection du volet en cours d'appui (-1 = aucun)
+// pressedButton   : bouton monter/stop/descendre en cours d'appui (-1 = aucun)
+void drawCovers(int pressedSelector=-1,int pressedButton=-1){
+  drawCardFrame(coversBlock.bounds,"Volets",coversBlock.titleHeight);
+  int selectorCellWidth=coversBlock.bounds.w/COVER_COUNT;
+  int currentY=coversBlock.bounds.y+coversBlock.titleHeight;
 
-  // ---- selecteur de volet ----
+  // ---- sélecteur de volet ----
   for(int i=0;i<COVER_COUNT;i++){
-    bool hi=(i==pressedSel)||(i==selectedCover);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=coversBlock.r.x+i*selCw;
-    display.fillRect(x,y,selCw,coversBlock.selectH,bg);
-    display.setTextColor(fg,bg); display.setTextSize(1);
-    display.drawString(covers[i].title,x+selCw/2,y+coversBlock.selectH/2);
+    bool isHighlighted=(i==pressedSelector)||(i==selectedCover);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=coversBlock.bounds.x+i*selectorCellWidth;
+    display.fillRect(cellX,currentY,selectorCellWidth,coversBlock.selectHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1);
+    display.drawString(covers[i].title,cellX+selectorCellWidth/2,currentY+coversBlock.selectHeight/2);
   }
-  for(int i=1;i<COVER_COUNT;i++) vline(coversBlock.r.x+i*selCw,y,coversBlock.selectH,TFT_BLACK,LT);
-  y+=coversBlock.selectH; hline(coversBlock.r.x,y,coversBlock.r.w,TFT_BLACK,LT);
+  for(int i=1;i<COVER_COUNT;i++) drawVerticalLine(coversBlock.bounds.x+i*selectorCellWidth,currentY,coversBlock.selectHeight,TFT_BLACK,LINE_THICKNESS);
+  currentY+=coversBlock.selectHeight; drawHorizontalLine(coversBlock.bounds.x,currentY,coversBlock.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
-  // ---- commandes du volet selectionne (affichees une seule fois) ----
-  CoverCard& c=covers[selectedCover];
-  int cw=coversBlock.r.w/3, s=min(cw,coversBlock.buttonsH)/4;
+  // ---- commandes du volet sélectionné (affichées une seule fois) ----
+  int buttonCellWidth=coversBlock.bounds.w/3, stopIconSize=min(buttonCellWidth,coversBlock.buttonsHeight)/4;
+  display.loadFont(SpaceMono42); // police plus grande pour les flèches ↑ / ↓ (chargée une seule fois, pas à chaque bouton)
   for(int i=0;i<3;i++){
-    bool hi=(i==pressedBtn);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=coversBlock.r.x+i*cw,cx=x+cw/2,cy=y+coversBlock.buttonsH/2;
-    display.fillRect(x,y,cw,coversBlock.buttonsH,bg);
-    if(i==0) arrowUp(cx,cy,s,fg);
-    else if(i==1) stopIcon(cx,cy,(int)(s*.8),fg);
-    else arrowDown(cx,cy,s,fg);
+    bool isHighlighted=(i==pressedButton);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=coversBlock.bounds.x+i*buttonCellWidth, centerX=cellX+buttonCellWidth/2, centerY=currentY+coversBlock.buttonsHeight/2;
+    display.fillRect(cellX,currentY,buttonCellWidth,coversBlock.buttonsHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor);
+    if(i==0) display.drawString("↑",centerX,centerY);
+    else if(i==1) drawStopIcon(centerX,centerY,(int)(stopIconSize*.4),foregroundColor);
+    else display.drawString("↓",centerX,centerY);
   }
-  vline(coversBlock.r.x+cw,y,coversBlock.buttonsH,TFT_BLACK,LT);
-  vline(coversBlock.r.x+2*cw,y,coversBlock.buttonsH,TFT_BLACK,LT);
+  display.loadFont(SpaceMono26); // on revient à la police par défaut pour la suite
 
-  thickRound(coversBlock.r.x,coversBlock.r.y,coversBlock.r.w,coversBlock.r.h,R,TFT_BLACK,BT);
+  drawVerticalLine(coversBlock.bounds.x+buttonCellWidth,currentY,coversBlock.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(coversBlock.bounds.x+2*buttonCellWidth,currentY,coversBlock.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+
+  drawThickRoundedRect(coversBlock.bounds.x,coversBlock.bounds.y,coversBlock.bounds.w,coversBlock.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
-// pressedMode : bouton de mode en cours d'appui (-1 = aucun)
-// pressedTemp : bouton -/+ en cours d'appui (-1 = aucun)
-void drawClimate(int pressedMode=-1,int pressedTemp=-1){
-  cardFrame(climate.r,"Climatisation",climate.titleH);
-  int cw=climate.r.w/3;
-  int y=climate.r.y+climate.titleH;
+// pressedModeIndex : bouton de mode en cours d'appui (-1 = aucun)
+// pressedTempIndex : bouton -/+ en cours d'appui (-1 = aucun)
+void drawClimate(int pressedModeIndex=-1,int pressedTempIndex=-1){
+  drawCardFrame(climate.bounds,"Climatisation",climate.titleHeight);
+  int cellWidth=climate.bounds.w/3;
+  int currentY=climate.bounds.y+climate.titleHeight;
 
-  // ---- ligne mode : icone volutes (chauffage) / icone flocon (clim) / OFF ----
-  int modeIconS=min(cw,climate.modeH)/4;
+  // ---- ligne mode : icône volutes (chauffage) / icône flocon (clim) / OFF ----
+  int modeIconSize=min(cellWidth,climate.modeHeight)/4;
   for(int i=0;i<3;i++){
-    bool hi=(i==pressedMode)||(hvacMode==HVAC_MODES[i]);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=climate.r.x+i*cw,cx=x+cw/2,cy=y+climate.modeH/2;
-    display.fillRect(x,y,cw,climate.modeH,bg);
-    if(i==0) heatingIcon(cx,cy,modeIconS,fg);
-    else if(i==1) snowIcon(cx,cy,modeIconS,fg);
-    else{ display.setTextColor(fg,bg); display.setTextSize(1); display.drawString(HVAC_LABELS[i],cx,cy); }
+    bool isHighlighted=(i==pressedModeIndex)||(hvacMode==HVAC_MODES[i]);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=climate.bounds.x+i*cellWidth, centerX=cellX+cellWidth/2, centerY=currentY+climate.modeHeight/2;
+    display.fillRect(cellX,currentY,cellWidth,climate.modeHeight,backgroundColor);
+    if(i==0) drawHeatingIcon(centerX,centerY,modeIconSize,foregroundColor);
+    else if(i==1) drawSnowflakeIcon(centerX,centerY,modeIconSize,foregroundColor);
+    else{ display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1); display.drawString(HVAC_LABELS[i],centerX,centerY); }
   }
-  vline(climate.r.x+cw,y,climate.modeH,TFT_BLACK,LT);
-  vline(climate.r.x+2*cw,y,climate.modeH,TFT_BLACK,LT);
-  y+=climate.modeH; hline(climate.r.x,y,climate.r.w,TFT_BLACK,LT);
+  drawVerticalLine(climate.bounds.x+cellWidth,currentY,climate.modeHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(climate.bounds.x+2*cellWidth,currentY,climate.modeHeight,TFT_BLACK,LINE_THICKNESS);
+  currentY+=climate.modeHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
   // ---- ligne consigne : - / valeur / + ----
-  String tempLabel=hasTarget?String(targetTemp,1)+"°C":"--";
+  String targetTempLabel=hasTarget?String(targetTemp,1)+"°C":"--";
   for(int i=0;i<3;i++){
-    bool hi=(i==pressedTemp);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=climate.r.x+i*cw,cx=x+cw/2,cy=y+climate.tempH/2;
-    display.fillRect(x,y,cw,climate.tempH,bg);
-    display.setTextColor(fg,bg); display.setTextSize(1);
-    if(i==0) display.drawString("-",cx,cy);
-    else if(i==1) display.drawString(tempLabel.c_str(),cx,cy);
-    else display.drawString("+",cx,cy);
+    bool isHighlighted=(i==pressedTempIndex);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=climate.bounds.x+i*cellWidth, centerX=cellX+cellWidth/2, centerY=currentY+climate.tempHeight/2;
+    display.fillRect(cellX,currentY,cellWidth,climate.tempHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1);
+    if(i==0) display.drawString("-",centerX,centerY);
+    else if(i==1) display.drawString(targetTempLabel.c_str(),centerX,centerY);
+    else display.drawString("+",centerX,centerY);
   }
-  vline(climate.r.x+cw,y,climate.tempH,TFT_BLACK,LT);
-  vline(climate.r.x+2*cw,y,climate.tempH,TFT_BLACK,LT);
-  y+=climate.tempH; hline(climate.r.x,y,climate.r.w,TFT_BLACK,LT);
+  drawVerticalLine(climate.bounds.x+cellWidth,currentY,climate.tempHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(climate.bounds.x+2*cellWidth,currentY,climate.tempHeight,TFT_BLACK,LINE_THICKNESS);
+  currentY+=climate.tempHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
   // ---- ligne info : température actuelle + humidité (salon) ----
-  String t=hasCurrent?String(currentTemp,1)+"°C":"--";
-  String h=hasHumidity?String(currentHumidity,0)+"%":"--";
+  String indoorTempLabel=hasCurrent?String(currentTemp,1)+"°C":"--";
+  String indoorHumidityLabel=hasHumidity?String(currentHumidity,0)+"%":"--";
   display.setTextColor(TFT_BLACK,TFT_WHITE); display.setTextSize(1);
-  display.drawString(("Salon "+t+" "+h).c_str(),climate.r.x+climate.r.w/2,y+climate.infoH/2);
-  y+=climate.infoH; hline(climate.r.x,y,climate.r.w,TFT_BLACK,LT);
+  display.drawString(("Salon "+indoorTempLabel+" "+indoorHumidityLabel).c_str(),
+                     climate.bounds.x+climate.bounds.w/2,currentY+climate.indoorInfoHeight/2);
+  currentY+=climate.indoorInfoHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
   // ---- ligne info : température/humidité extérieure ----
-  String ot=hasOutdoorTemp?String(outdoorTemp,1)+"°C":"--";
-  String oh=hasOutdoorHumidity?String(outdoorHumidity,0)+"%":"--";
-  display.drawString(("Exter "+ot+" "+oh).c_str(),climate.r.x+climate.r.w/2,y+climate.infoH2/2);
+  String outdoorTempLabel=hasOutdoorTemp?String(outdoorTemp,1)+"°C":"--";
+  String outdoorHumidityLabel=hasOutdoorHumidity?String(outdoorHumidity,0)+"%":"--";
+  display.drawString(("Exter "+outdoorTempLabel+" "+outdoorHumidityLabel).c_str(),
+                     climate.bounds.x+climate.bounds.w/2,currentY+climate.outdoorInfoHeight/2);
 
-  thickRound(climate.r.x,climate.r.y,climate.r.w,climate.r.h,R,TFT_BLACK,BT);
+  drawThickRoundedRect(climate.bounds.x,climate.bounds.y,climate.bounds.w,climate.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
-void drawSpotify(int pressed=-1){
-  cardFrame(spotifyCard.r,"Spotify",spotifyCard.titleH);
+void drawSpotify(int pressedIndex=-1){
+  drawCardFrame(spotifyCard.bounds,"Spotify",spotifyCard.titleHeight);
 
-  int y=spotifyCard.r.y+spotifyCard.titleH;
+  int currentY=spotifyCard.bounds.y+spotifyCard.titleHeight;
 
   // ---- titre + artiste ----
   display.setTextColor(TFT_BLACK,TFT_WHITE);
   display.setTextSize(1);
-  String title=hasSpotify && spotifyTitle.length()?spotifyTitle:"Aucune lecture";
-  String artist=hasSpotify && spotifyArtist.length()?spotifyArtist:"";
+  String trackTitle=hasSpotify && spotifyTitle.length()?spotifyTitle:"Aucune lecture";
+  String trackArtist=hasSpotify && spotifyArtist.length()?spotifyArtist:"";
 
-  int lineH=spotifyCard.infoH/2;
+  int lineHeight=spotifyCard.infoHeight/2;
 
-display.drawString(
-  title.c_str(),
-  spotifyCard.r.x+spotifyCard.r.w/2,
-  y+lineH/2
-);
-
-if(artist.length()){
   display.drawString(
-    artist.c_str(),
-    spotifyCard.r.x+spotifyCard.r.w/2,
-    y+lineH+lineH/2
+    trackTitle.c_str(),
+    spotifyCard.bounds.x+spotifyCard.bounds.w/2,
+    currentY+lineHeight/2
   );
-}
 
-  y+=spotifyCard.infoH;
-  hline(spotifyCard.r.x,y,spotifyCard.r.w,TFT_BLACK,LT);
+  if(trackArtist.length()){
+    display.drawString(
+      trackArtist.c_str(),
+      spotifyCard.bounds.x+spotifyCard.bounds.w/2,
+      currentY+lineHeight+lineHeight/2
+    );
+  }
+
+  currentY+=spotifyCard.infoHeight;
+  drawHorizontalLine(spotifyCard.bounds.x,currentY,spotifyCard.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
   // ---- commandes : précédent / pause / suivant ----
-  int cw=spotifyCard.r.w/3;
-  int s=min(cw,spotifyCard.buttonsH)/4;
+  int cellWidth=spotifyCard.bounds.w/3;
+  int iconSize=min(cellWidth,spotifyCard.buttonsHeight)/4;
   for(int i=0;i<3;i++){
-    bool hi=(i==pressed);
-    uint32_t bg=hi?TFT_BLACK:TFT_WHITE, fg=hi?TFT_WHITE:TFT_BLACK;
-    int x=spotifyCard.r.x+i*cw,cx=x+cw/2,cy=y+spotifyCard.buttonsH/2;
-    display.fillRect(x,y,cw,spotifyCard.buttonsH,bg);
+    bool isHighlighted=(i==pressedIndex);
+    uint32_t backgroundColor=isHighlighted?TFT_BLACK:TFT_WHITE, foregroundColor=isHighlighted?TFT_WHITE:TFT_BLACK;
+    int cellX=spotifyCard.bounds.x+i*cellWidth, centerX=cellX+cellWidth/2, centerY=currentY+spotifyCard.buttonsHeight/2;
+    display.fillRect(cellX,currentY,cellWidth,spotifyCard.buttonsHeight,backgroundColor);
 
-    if(i==0) prevIcon(cx,cy,s,fg);
-    else if(i==1) pauseIcon(cx,cy,s,fg);
-    else nextIcon(cx,cy,s,fg);
+    if(i==0) drawPreviousIcon(centerX,centerY,iconSize,foregroundColor);
+    else if(i==1) drawPauseIcon(centerX,centerY,iconSize,foregroundColor);
+    else drawNextIcon(centerX,centerY,iconSize,foregroundColor);
   }
-  vline(spotifyCard.r.x+cw,y,spotifyCard.buttonsH,TFT_BLACK,LT);
-  vline(spotifyCard.r.x+2*cw,y,spotifyCard.buttonsH,TFT_BLACK,LT);
+  drawVerticalLine(spotifyCard.bounds.x+cellWidth,currentY,spotifyCard.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
+  drawVerticalLine(spotifyCard.bounds.x+2*cellWidth,currentY,spotifyCard.buttonsHeight,TFT_BLACK,LINE_THICKNESS);
 
-  thickRound(spotifyCard.r.x,spotifyCard.r.y,spotifyCard.r.w,spotifyCard.r.h,R,TFT_BLACK,BT);
+  drawThickRoundedRect(spotifyCard.bounds.x,spotifyCard.bounds.y,spotifyCard.bounds.w,spotifyCard.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
 void drawWifi(bool pressed=false){
-  cardFrame(wifiCard.r,"Hotspot Wi-Fi",wifiCard.titleH);
-  int y=wifiCard.r.y+wifiCard.titleH;
+  drawCardFrame(wifiCard.bounds,"Hotspot Wi-Fi",wifiCard.titleHeight);
+  int currentY=wifiCard.bounds.y+wifiCard.titleHeight;
   if(hasVoucher){
     display.setTextColor(TFT_BLACK,TFT_WHITE); display.setTextSize(1);
-    display.drawString(WIFI_NAME,wifiCard.r.x+wifiCard.r.w/2,y+wifiCard.buttonH/2);
-    y+=wifiCard.buttonH; hline(wifiCard.r.x,y,wifiCard.r.w,TFT_BLACK,LT);
+    display.drawString(WIFI_NAME,wifiCard.bounds.x+wifiCard.bounds.w/2,currentY+wifiCard.buttonHeight/2);
+    currentY+=wifiCard.buttonHeight; drawHorizontalLine(wifiCard.bounds.x,currentY,wifiCard.bounds.w,TFT_BLACK,LINE_THICKNESS);
     display.drawString(("Mot de passe : "+String(WIFI_GUEST_PASSWORD)).c_str(),
-                       wifiCard.r.x+wifiCard.r.w/2,y+wifiCard.passwordH/2);
-    y+=wifiCard.passwordH; hline(wifiCard.r.x,y,wifiCard.r.w,TFT_BLACK,LT);
+                       wifiCard.bounds.x+wifiCard.bounds.w/2,currentY+wifiCard.passwordHeight/2);
+    currentY+=wifiCard.passwordHeight; drawHorizontalLine(wifiCard.bounds.x,currentY,wifiCard.bounds.w,TFT_BLACK,LINE_THICKNESS);
     display.drawString(("Code : "+voucherCode).c_str(),
-                       wifiCard.r.x+wifiCard.r.w/2,y+wifiCard.codeH/2);
+                       wifiCard.bounds.x+wifiCard.bounds.w/2,currentY+wifiCard.codeHeight/2);
   }else{
-    int h=wifiCard.buttonH+wifiCard.passwordH+wifiCard.codeH;
-    uint32_t bg=pressed?TFT_BLACK:TFT_WHITE,fg=pressed?TFT_WHITE:TFT_BLACK;
-    display.fillRect(wifiCard.r.x,y,wifiCard.r.w,h,bg);
-    display.setTextColor(fg,bg); display.setTextSize(1);
-    display.drawString("Activer hotspot",wifiCard.r.x+wifiCard.r.w/2,y+h/2);
+    int totalHeight=wifiCard.buttonHeight+wifiCard.passwordHeight+wifiCard.codeHeight;
+    uint32_t backgroundColor=pressed?TFT_BLACK:TFT_WHITE, foregroundColor=pressed?TFT_WHITE:TFT_BLACK;
+    display.fillRect(wifiCard.bounds.x,currentY,wifiCard.bounds.w,totalHeight,backgroundColor);
+    display.setTextColor(foregroundColor,backgroundColor); display.setTextSize(1);
+    display.drawString("Activer hotspot",wifiCard.bounds.x+wifiCard.bounds.w/2,currentY+totalHeight/2);
   }
-  thickRound(wifiCard.r.x,wifiCard.r.y,wifiCard.r.w,wifiCard.r.h,R,TFT_BLACK,BT);
+  drawThickRoundedRect(wifiCard.bounds.x,wifiCard.bounds.y,wifiCard.bounds.w,wifiCard.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
-void status(const char* s){
+void showStatus(const char* message){
   display.startWrite();
   display.fillRect(0,0,display.width(),35,TFT_WHITE);
   display.setTextDatum(top_left); display.setTextColor(TFT_BLACK,TFT_WHITE);
-  display.setTextSize(1); display.drawString(s,10,8);
+  display.setTextSize(1); display.drawString(message,10,8);
   display.endWrite();
 }
 
 // ---------- Layout ----------
 void setupLayout(){
-  int W=display.width(),m=12,cw=W-2*m,g=12;
+  int screenWidth=display.width(), marginX=12, cardWidth=screenWidth-2*marginX, gapBetweenCards=12;
 
   // ---------- Page 1 ----------
   // Eclairage, puis Modes, puis Spotify, puis Climatisation.
-  int y=45;
+  int currentY=45;
 
-  for(auto a:actions){
-    a->titleH=LINE_SMALL;
-    a->buttonsH=(a==&lighting)?(2*LINE_MEDIUM):LINE_MEDIUM;
-    a->cellW=cw/3;
+  for(auto actionCard:actionCards){
+    actionCard->titleHeight=LINE_SMALL;
+    actionCard->buttonsHeight=(actionCard==&lighting)?(2*LINE_MEDIUM):LINE_MEDIUM;
+    actionCard->cellWidth=cardWidth/3;
 
-    a->r={
-      m,
-      y,
-      cw,
-      a->titleH+a->buttonsH
-    };
+    actionCard->bounds={marginX,currentY,cardWidth,actionCard->titleHeight+actionCard->buttonsHeight};
 
-    y+=a->r.h+g;
+    currentY+=actionCard->bounds.h+gapBetweenCards;
 
-    // Spotify est place juste sous les Modes.
-    if(a==&modes){
-      spotifyCard.titleH=LINE_SMALL;
-      spotifyCard.infoH=LINE_MEDIUM;
-      spotifyCard.buttonsH=LINE_MEDIUM;
+    // Spotify est placé juste sous les Modes.
+    if(actionCard==&modes){
+      spotifyCard.titleHeight=LINE_SMALL;
+      spotifyCard.infoHeight=LINE_MEDIUM;
+      spotifyCard.buttonsHeight=LINE_MEDIUM;
 
-      spotifyCard.r={
-        m,
-        y,
-        cw,
-        spotifyCard.titleH+
-        spotifyCard.infoH+
-        spotifyCard.buttonsH
-      };
+      spotifyCard.bounds={marginX,currentY,cardWidth,
+        spotifyCard.titleHeight+spotifyCard.infoHeight+spotifyCard.buttonsHeight};
 
-      y+=spotifyCard.r.h+g;
+      currentY+=spotifyCard.bounds.h+gapBetweenCards;
     }
   }
 
   // ---------- Climatisation ----------
-  climate.titleH=LINE_SMALL;
-  climate.modeH=LINE_MEDIUM;
-  climate.tempH=LINE_MEDIUM;
-  climate.infoH=LINE_SMALL;
-  climate.infoH2=LINE_SMALL;
-  climate.cellW=cw/3;
+  climate.titleHeight=LINE_SMALL;
+  climate.modeHeight=LINE_MEDIUM;
+  climate.tempHeight=LINE_MEDIUM;
+  climate.indoorInfoHeight=LINE_SMALL;
+  climate.outdoorInfoHeight=LINE_SMALL;
+  climate.cellWidth=cardWidth/3;
 
-  climate.r={
-    m,
-    y,
-    cw,
-    climate.titleH+
-    climate.modeH+
-    climate.tempH+
-    climate.infoH+
-    climate.infoH2
-  };
-
+  climate.bounds={marginX,currentY,cardWidth,
+    climate.titleHeight+climate.modeHeight+climate.tempHeight+climate.indoorInfoHeight+climate.outdoorInfoHeight};
 
   // ---------- Page 2 ----------
   // Volets en premier, puis Hotspot Wi-Fi.
-  int y2=45;
+  int page2Y=45;
 
-  coversBlock.titleH=LINE_SMALL;
-  coversBlock.selectH=56;
-  coversBlock.buttonsH=LINE_LARGE;
+  coversBlock.titleHeight=LINE_SMALL;
+  coversBlock.selectHeight=LINE_MEDIUM; // ligne de sélection de la pièce (CUISINE/SALON)
+  coversBlock.buttonsHeight=LINE_MEDIUM;
 
-  coversBlock.r={
-    m,
-    y2,
-    cw,
-    coversBlock.titleH+
-    coversBlock.selectH+
-    coversBlock.buttonsH
-  };
+  coversBlock.bounds={marginX,page2Y,cardWidth,
+    coversBlock.titleHeight+coversBlock.selectHeight+coversBlock.buttonsHeight};
 
-  y2+=coversBlock.r.h+g;
+  page2Y+=coversBlock.bounds.h+gapBetweenCards;
 
   // ---------- Hotspot Wi-Fi ----------
-  wifiCard.titleH=LINE_SMALL;
-  wifiCard.buttonH=LINE_SMALL;
-  wifiCard.passwordH=LINE_SMALL;
-  wifiCard.codeH=LINE_SMALL;
+  wifiCard.titleHeight=LINE_SMALL;
+  wifiCard.buttonHeight=LINE_SMALL;
+  wifiCard.passwordHeight=LINE_SMALL;
+  wifiCard.codeHeight=LINE_SMALL;
 
-  wifiCard.r={
-    m,
-    y2,
-    cw,
-    wifiCard.titleH+
-    wifiCard.buttonH+
-    wifiCard.passwordH+
-    wifiCard.codeH
-  };
+  wifiCard.bounds={marginX,page2Y,cardWidth,
+    wifiCard.titleHeight+wifiCard.buttonHeight+wifiCard.passwordHeight+wifiCard.codeHeight};
 }
+
 // ---------- Home Assistant ----------
 // extra : champs JSON additionnels, ex: ",\"temperature\":21.5"
 bool haCall(const char* domain,const char* service,const char* entity,const String& extra=""){
-  if(WiFi.status()!=WL_CONNECTED){status("Wi-Fi déconnecté");return false;}
+  if(WiFi.status()!=WL_CONNECTED){showStatus("Wi-Fi déconnecté");return false;}
   HTTPClient http;
   http.begin(String(HA_HOST)+"/api/services/"+domain+"/"+service);
   http.addHeader("Authorization",String("Bearer ")+HA_TOKEN);
   http.addHeader("Content-Type","application/json");
-  String body=String("{\"entity_id\":\"")+entity+"\""+extra+"}";
-  int code=http.POST(body);
+  String requestBody=String("{\"entity_id\":\"")+entity+"\""+extra+"}";
+  int httpStatusCode=http.POST(requestBody);
   http.end();
-  return code>0&&code<300;
+  return httpStatusCode>0&&httpStatusCode<300;
 }
 
 bool haState(const char* entity,DynamicJsonDocument& doc){
@@ -533,54 +516,54 @@ bool haState(const char* entity,DynamicJsonDocument& doc){
   HTTPClient http;
   http.begin(String(HA_HOST)+"/api/states/"+entity);
   http.addHeader("Authorization",String("Bearer ")+HA_TOKEN);
-  int code=http.GET(); bool ok=false;
-  if(code==200) ok=deserializeJson(doc,http.getString())==DeserializationError::Ok;
-  http.end(); return ok;
+  int httpStatusCode=http.GET(); bool success=false;
+  if(httpStatusCode==200) success=deserializeJson(doc,http.getString())==DeserializationError::Ok;
+  http.end(); return success;
 }
 
-void refreshAction(ActionCard& a){
-  int n=&a==&lighting?6:3;
-  for(int i=0;i<n;i++){
-    if(!a.state[i]){a.active[i]=false;continue;}
-    DynamicJsonDocument d(512);
-    a.active[i]=haState(a.state[i],d)&&d["state"].as<String>()=="on";
+void refreshAction(ActionCard& actionCard){
+  int buttonCount=&actionCard==&lighting?6:3;
+  for(int i=0;i<buttonCount;i++){
+    if(!actionCard.state[i]){actionCard.active[i]=false;continue;}
+    DynamicJsonDocument stateDoc(512);
+    actionCard.active[i]=haState(actionCard.state[i],stateDoc)&&stateDoc["state"].as<String>()=="on";
   }
 }
 
-void refreshCover(CoverCard& c){
-  DynamicJsonDocument d(512);
-  if(haState(c.entity,d)) c.state=d["state"].as<String>();
+void refreshCover(CoverCard& coverCard){
+  DynamicJsonDocument stateDoc(512);
+  if(haState(coverCard.entity,stateDoc)) coverCard.state=stateDoc["state"].as<String>();
 }
 
 void refreshClimate(){
-  DynamicJsonDocument d(2048);
-  if(haState(ENTITY_CLIMATE,d)){
-    hvacMode=d["state"].as<String>();   // "heat" / "cool" / "off" / autre
-    if(!d["attributes"]["temperature"].isNull()){
-      targetTemp=d["attributes"]["temperature"].as<float>();hasTarget=true;
+  DynamicJsonDocument climateDoc(2048);
+  if(haState(ENTITY_CLIMATE,climateDoc)){
+    hvacMode=climateDoc["state"].as<String>();   // "heat" / "cool" / "off" / autre
+    if(!climateDoc["attributes"]["temperature"].isNull()){
+      targetTemp=climateDoc["attributes"]["temperature"].as<float>();hasTarget=true;
     }
   }
-  DynamicJsonDocument s(1024);
-  if(haState(ENTITY_TEMP,s)){
-    const char* v=s["state"]; if(v){currentTemp=atof(v);hasCurrent=true;}
+  DynamicJsonDocument indoorTempDoc(1024);
+  if(haState(ENTITY_TEMP,indoorTempDoc)){
+    const char* v=indoorTempDoc["state"]; if(v){currentTemp=atof(v);hasCurrent=true;}
   }
-  DynamicJsonDocument hDoc(1024);
-  if(haState(ENTITY_HUMIDITY,hDoc)){
-    const char* v=hDoc["state"]; if(v){currentHumidity=atof(v);hasHumidity=true;}
+  DynamicJsonDocument indoorHumidityDoc(1024);
+  if(haState(ENTITY_HUMIDITY,indoorHumidityDoc)){
+    const char* v=indoorHumidityDoc["state"]; if(v){currentHumidity=atof(v);hasHumidity=true;}
   }
-  DynamicJsonDocument otDoc(1024);
-  if(haState(ENTITY_OUTDOOR_TEMP,otDoc)){
-    const char* v=otDoc["state"]; if(v){outdoorTemp=atof(v);hasOutdoorTemp=true;}
+  DynamicJsonDocument outdoorTempDoc(1024);
+  if(haState(ENTITY_OUTDOOR_TEMP,outdoorTempDoc)){
+    const char* v=outdoorTempDoc["state"]; if(v){outdoorTemp=atof(v);hasOutdoorTemp=true;}
   }
-  DynamicJsonDocument ohDoc(1024);
-  if(haState(ENTITY_OUTDOOR_HUMIDITY,ohDoc)){
-    const char* v=ohDoc["state"]; if(v){outdoorHumidity=atof(v);hasOutdoorHumidity=true;}
+  DynamicJsonDocument outdoorHumidityDoc(1024);
+  if(haState(ENTITY_OUTDOOR_HUMIDITY,outdoorHumidityDoc)){
+    const char* v=outdoorHumidityDoc["state"]; if(v){outdoorHumidity=atof(v);hasOutdoorHumidity=true;}
   }
 }
 
 void refreshSpotify(){
-  DynamicJsonDocument d(2048);
-  if(!haState(ENTITY_SPOTIFY,d)){
+  DynamicJsonDocument spotifyDoc(2048);
+  if(!haState(ENTITY_SPOTIFY,spotifyDoc)){
     hasSpotify=false;
     spotifyTitle="";
     spotifyArtist="";
@@ -588,38 +571,41 @@ void refreshSpotify(){
     return;
   }
 
-  spotifyState=d["state"].as<String>();
-  spotifyTitle=d["attributes"]["media_title"].as<String>();
-  spotifyArtist=d["attributes"]["media_artist"].as<String>();
+  spotifyState=spotifyDoc["state"].as<String>();
+  spotifyTitle=spotifyDoc["attributes"]["media_title"].as<String>();
+  spotifyArtist=spotifyDoc["attributes"]["media_artist"].as<String>();
   hasSpotify=(spotifyTitle.length()>0 || spotifyArtist.length()>0);
 }
 
 void refreshVoucher(){
-  DynamicJsonDocument d(8192);
-  if(!haState(ENTITY_WIFI_SENSOR,d))return;
-  JsonArray a=d["attributes"]["data"].as<JsonArray>();
-  if(a.isNull()||!a.size()){hasVoucher=false;voucherCode="";return;}
-  JsonObject latest; String date;
-  for(JsonObject v:a){String z=v["createdAt"].as<String>();if(latest.isNull()||z>date){latest=v;date=z;}}
-  const char* code=latest["code"];
+  DynamicJsonDocument voucherListDoc(8192);
+  if(!haState(ENTITY_WIFI_SENSOR,voucherListDoc))return;
+  JsonArray vouchers=voucherListDoc["attributes"]["data"].as<JsonArray>();
+  if(vouchers.isNull()||!vouchers.size()){hasVoucher=false;voucherCode="";return;}
+  JsonObject latestVoucher; String latestDate;
+  for(JsonObject voucher:vouchers){
+    String createdAt=voucher["createdAt"].as<String>();
+    if(latestVoucher.isNull()||createdAt>latestDate){latestVoucher=voucher;latestDate=createdAt;}
+  }
+  const char* code=latestVoucher["code"];
   if(code){
-    String s=code;
-    voucherCode=s.length()==10?s.substring(0,5)+"-"+s.substring(5):s;
+    String rawCode=code;
+    voucherCode=rawCode.length()==10?rawCode.substring(0,5)+"-"+rawCode.substring(5):rawCode;
     hasVoucher=true;
   }
 }
 
 void connectWifi(){
-  status("Connexion Wi-Fi...");
+  showStatus("Connexion Wi-Fi...");
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
-  unsigned long t=millis();
-  while(WiFi.status()!=WL_CONNECTED&&millis()-t<15000)delay(300);
-  status(WiFi.status()==WL_CONNECTED?"Wi-Fi connecté":"Echec WiFi");
+  unsigned long startTime=millis();
+  while(WiFi.status()!=WL_CONNECTED&&millis()-startTime<15000)delay(300);
+  showStatus(WiFi.status()==WL_CONNECTED?"Wi-Fi connecté":"Echec WiFi");
 }
 
 // ---------- Pages ----------
 // Effacement physique complet avant chaque changement de page.
-// On utilise un mode EPD de qualite pour eviter les artefacts/ghosting.
+// On utilise un mode EPD de qualité pour éviter les artefacts/ghosting.
 void cleanScreen(){
   display.setEpdMode(epd_mode_t::epd_quality);
   display.startWrite();
@@ -629,13 +615,12 @@ void cleanScreen(){
 }
 
 void drawPage(){
-  // Toujours effacer completement l'ancien contenu avant de dessiner
-  // la nouvelle page.
+  // Toujours effacer complètement l'ancien contenu avant de dessiner la nouvelle page.
   cleanScreen();
 
   display.startWrite();
-  if(page==1){
-    for(auto a:actions)drawAction(*a);
+  if(currentPage==1){
+    for(auto actionCard:actionCards)drawAction(*actionCard);
     drawSpotify();
     drawClimate();
   }else{
@@ -643,168 +628,172 @@ void drawPage(){
     drawWifi();
   }
   display.endWrite();
-  status(page==1?"Page 1/2":"Page 2/2");
+  showStatus(currentPage==1?"Page 1/2":"Page 2/2");
 }
 
 void changePage(int delta){
-  page+=delta;
-  if(page<1)page=2;
-  if(page>2)page=1;
+  currentPage+=delta;
+  if(currentPage<1)currentPage=2;
+  if(currentPage>2)currentPage=1;
   resetActivityTimer();
-  if(page==1) refreshSpotify();
+  if(currentPage==1) refreshSpotify();
   drawPage();
 }
 
-void resetActivityTimer(){lastActivity=millis();}
+void resetActivityTimer(){lastActivityTime=millis();}
 
 bool pageButtons(){
-  if(millis()-lastButton<BTN_DEBOUNCE_MS)return false;
-  if(digitalRead(G37)==LOW){lastButton=millis();changePage(-1);return true;}
-  if(digitalRead(G39)==LOW){lastButton=millis();changePage(1);return true;}
+  if(millis()-lastButtonPressTime<BUTTON_DEBOUNCE_MS)return false;
+  if(digitalRead(PIN_BUTTON_PREV)==LOW){lastButtonPressTime=millis();changePage(-1);return true;}
+  if(digitalRead(PIN_BUTTON_NEXT)==LOW){lastButtonPressTime=millis();changePage(1);return true;}
   return false;
 }
 
 // ---------- Deep sleep ----------
 void enterDeepSleep(){
-  lgfx::touch_point_t tp;
-  while(digitalRead(TOUCH_INT)==LOW){display.getTouch(&tp);delay(20);}
-  esp_sleep_enable_ext0_wakeup(TOUCH_INT,0);
+  lgfx::touch_point_t touchPoint;
+  while(digitalRead(PIN_TOUCH_INTERRUPT)==LOW){display.getTouch(&touchPoint);delay(20);}
+  esp_sleep_enable_ext0_wakeup(PIN_TOUCH_INTERRUPT,0);
   display.startWrite(); display.fillScreen(TFT_WHITE);
   display.setTextDatum(middle_center);display.setTextColor(TFT_BLACK,TFT_WHITE);
-  display.loadFont(SpaceMono36);
+  display.loadFont(SpaceMono42);
   display.setTextSize(1);display.drawString("RÉVEILLE-MOI",display.width()/2,display.height()/2);
   display.endWrite(); display.display();
   WiFi.disconnect(true);WiFi.mode(WIFI_OFF);display.setBrightness(0);
-  gpio_hold_en(MAIN_PWR);gpio_deep_sleep_hold_en();Serial.flush();esp_deep_sleep_start();
+  gpio_hold_en(PIN_MAIN_POWER);gpio_deep_sleep_hold_en();Serial.flush();esp_deep_sleep_start();
 }
 
 // ---------- Touch ----------
-int threeIndex(const Rect&r,int cw,int x){return constrain((x-r.x)/cw,0,2);}
-int sixIndex(const ActionCard&a,int x,int y){
-  int cw=a.r.w/3,rh=a.buttonsH/2,by=a.r.y+a.titleH;
-  return constrain((y-by)/rh,0,1)*3+constrain((x-a.r.x)/cw,0,2);
+// Retourne l'index (0,1,2) de la colonne touchée dans une rangée à 3 cellules.
+int columnIndexFromX(const Rect& bounds,int cellWidth,int touchX){
+  return constrain((touchX-bounds.x)/cellWidth,0,2);
+}
+// Retourne l'index (0..5) du bouton touché dans la grille 3x2 de la carte Eclairage.
+int gridIndexFromXY(const ActionCard& actionCard,int touchX,int touchY){
+  int cellWidth=actionCard.bounds.w/3, rowHeight=actionCard.buttonsHeight/2, gridTop=actionCard.bounds.y+actionCard.titleHeight;
+  return constrain((touchY-gridTop)/rowHeight,0,1)*3+constrain((touchX-actionCard.bounds.x)/cellWidth,0,2);
 }
 
-bool touchAction(ActionCard&a,int x,int y){
-  if(!inRect(a.r,x,y)||y<a.r.y+a.titleH)return false;
-  int i=&a==&lighting?sixIndex(a,x,y):threeIndex(a.r,a.cellW,x);
-  display.startWrite();drawAction(a,i);display.endWrite();
-  status((String(a.label[i])+"...").c_str());
-  bool ok=haCall(a.domain[i],a.service[i],a.entity[i]);
-  status(ok?"OK":"Erreur commande HA");delay(300);
-  refreshAction(a);display.startWrite();drawAction(a);display.endWrite();return true;
+bool touchAction(ActionCard& actionCard,int touchX,int touchY){
+  if(!inRect(actionCard.bounds,touchX,touchY)||touchY<actionCard.bounds.y+actionCard.titleHeight)return false;
+  int pressedIndex=&actionCard==&lighting?gridIndexFromXY(actionCard,touchX,touchY):columnIndexFromX(actionCard.bounds,actionCard.cellWidth,touchX);
+  display.startWrite();drawAction(actionCard,pressedIndex);display.endWrite();
+  showStatus((String(actionCard.label[pressedIndex])+"...").c_str());
+  bool ok=haCall(actionCard.domain[pressedIndex],actionCard.service[pressedIndex],actionCard.entity[pressedIndex]);
+  showStatus(ok?"OK":"Erreur commande HA");delay(300);
+  refreshAction(actionCard);display.startWrite();drawAction(actionCard);display.endWrite();return true;
 }
 
-bool touchCovers(int x,int y){
-  if(!inRect(coversBlock.r,x,y))return false;
-  int selY=coversBlock.r.y+coversBlock.titleH;
-  int btnY=selY+coversBlock.selectH;
+bool touchCovers(int touchX,int touchY){
+  if(!inRect(coversBlock.bounds,touchX,touchY))return false;
+  int selectorTop=coversBlock.bounds.y+coversBlock.titleHeight;
+  int buttonsTop=selectorTop+coversBlock.selectHeight;
 
-  // ---- selection du volet a piloter ----
-  if(y>=selY&&y<btnY){
-    int selCw=coversBlock.r.w/COVER_COUNT;
-    selectedCover=constrain((x-coversBlock.r.x)/selCw,0,COVER_COUNT-1);
+  // ---- sélection du volet à piloter ----
+  if(touchY>=selectorTop&&touchY<buttonsTop){
+    int selectorCellWidth=coversBlock.bounds.w/COVER_COUNT;
+    selectedCover=constrain((touchX-coversBlock.bounds.x)/selectorCellWidth,0,COVER_COUNT-1);
     display.startWrite();drawCovers();display.endWrite();
     return true;
   }
 
-  // ---- commande monter/stop/descendre : toujours envoyee a HA ----
-  if(y>=btnY){
-    int cw=coversBlock.r.w/3;
-    int i=constrain((x-coversBlock.r.x)/cw,0,2);
-    CoverCard& c=covers[selectedCover];
-    display.startWrite();drawCovers(-1,i);display.endWrite();
-    const char* s=i==0?"open_cover":i==1?"stop_cover":"close_cover";
-    status((String(c.title)+" : "+(i==0?"montee...":i==1?"stop...":"descente...")).c_str());
-    bool ok=haCall("cover",s,c.entity);
-    status(ok?"OK":"Erreur commande HA");delay(300);
-    refreshCover(c);
+  // ---- commande monter/stop/descendre : toujours envoyée à HA ----
+  if(touchY>=buttonsTop){
+    int cellWidth=coversBlock.bounds.w/3;
+    int pressedIndex=constrain((touchX-coversBlock.bounds.x)/cellWidth,0,2);
+    CoverCard& selectedCoverCard=covers[selectedCover];
+    display.startWrite();drawCovers(-1,pressedIndex);display.endWrite();
+    const char* service=pressedIndex==0?"open_cover":pressedIndex==1?"stop_cover":"close_cover";
+    showStatus((String(selectedCoverCard.title)+" : "+(pressedIndex==0?"montee...":pressedIndex==1?"stop...":"descente...")).c_str());
+    bool ok=haCall("cover",service,selectedCoverCard.entity);
+    showStatus(ok?"OK":"Erreur commande HA");delay(300);
+    refreshCover(selectedCoverCard);
     display.startWrite();drawCovers();display.endWrite();
   }
   return true;
 }
 
-bool touchClimate(int x,int y){
-  if(!inRect(climate.r,x,y))return false;
+bool touchClimate(int touchX,int touchY){
+  if(!inRect(climate.bounds,touchX,touchY))return false;
 
-  int modeY=climate.r.y+climate.titleH;
-  int tempY=modeY+climate.modeH;
-  int infoY=tempY+climate.tempH;
+  int modeRowTop=climate.bounds.y+climate.titleHeight;
+  int tempRowTop=modeRowTop+climate.modeHeight;
+  int infoRowTop=tempRowTop+climate.tempHeight;
 
   // ---- ligne mode : Chauffage / Clim / Off ----
-  if(y>=modeY&&y<tempY){
-    int i=constrain((x-climate.r.x)/climate.cellW,0,2);
-    display.startWrite();drawClimate(i,-1);display.endWrite();
-    status((String("Mode : ")+HVAC_LABELS[i]+"...").c_str());
-    bool ok=haCall("climate","set_hvac_mode",ENTITY_CLIMATE,String(",\"hvac_mode\":\"")+HVAC_MODES[i]+"\"");
-    if(ok)hvacMode=HVAC_MODES[i];
-    status(ok?"OK":"Erreur commande HA");delay(300);
+  if(touchY>=modeRowTop&&touchY<tempRowTop){
+    int pressedIndex=constrain((touchX-climate.bounds.x)/climate.cellWidth,0,2);
+    display.startWrite();drawClimate(pressedIndex,-1);display.endWrite();
+    showStatus((String("Mode : ")+HVAC_LABELS[pressedIndex]+"...").c_str());
+    bool ok=haCall("climate","set_hvac_mode",ENTITY_CLIMATE,String(",\"hvac_mode\":\"")+HVAC_MODES[pressedIndex]+"\"");
+    if(ok)hvacMode=HVAC_MODES[pressedIndex];
+    showStatus(ok?"OK":"Erreur commande HA");delay(300);
     refreshClimate();
     display.startWrite();drawClimate();display.endWrite();
-    status(page==1?"Page 1/2":"Page 2/2");
+    showStatus(currentPage==1?"Page 1/2":"Page 2/2");
     return true;
   }
 
   // ---- ligne consigne : - / valeur / + ----
-  if(y>=tempY&&y<infoY){
-    int i=constrain((x-climate.r.x)/climate.cellW,0,2);
-    if(i!=1){
-      float newTemp=constrain(targetTemp+(i==0?-TEMP_STEP:TEMP_STEP),TEMP_MIN,TEMP_MAX);
-      display.startWrite();drawClimate(-1,i);display.endWrite();
-      status(i==0?"Temperature -...":"Temperature +...");
-      char buf[8];snprintf(buf,sizeof(buf),"%.1f",newTemp);
-      bool ok=haCall("climate","set_temperature",ENTITY_CLIMATE,String(",\"temperature\":")+buf);
-      if(ok){targetTemp=newTemp;hasTarget=true;}
-      status(ok?"OK":"Erreur commande HA");delay(300);
+  if(touchY>=tempRowTop&&touchY<infoRowTop){
+    int pressedIndex=constrain((touchX-climate.bounds.x)/climate.cellWidth,0,2);
+    if(pressedIndex!=1){
+      float newTargetTemp=constrain(targetTemp+(pressedIndex==0?-TEMP_STEP:TEMP_STEP),TEMP_MIN,TEMP_MAX);
+      display.startWrite();drawClimate(-1,pressedIndex);display.endWrite();
+      showStatus(pressedIndex==0?"Temperature -...":"Temperature +...");
+      char tempBuffer[8];snprintf(tempBuffer,sizeof(tempBuffer),"%.1f",newTargetTemp);
+      bool ok=haCall("climate","set_temperature",ENTITY_CLIMATE,String(",\"temperature\":")+tempBuffer);
+      if(ok){targetTemp=newTargetTemp;hasTarget=true;}
+      showStatus(ok?"OK":"Erreur commande HA");delay(300);
     }
-    // Redessine uniquement la carte climatisation, sans effacement plein ecran.
+    // Redessine uniquement la carte climatisation, sans effacement plein écran.
     display.startWrite();drawClimate();display.endWrite();
-    status(page==1?"Page 1/2":"Page 2/2");
+    showStatus(currentPage==1?"Page 1/2":"Page 2/2");
     return true;
   }
 
-  return true; // toucher sur le titre : on ignore mais on consomme l'evenement
+  return true; // toucher sur le titre : on ignore mais on consomme l'événement
 }
 
-bool touchSpotify(int x,int y){
-  if(!inRect(spotifyCard.r,x,y))return false;
+bool touchSpotify(int touchX,int touchY){
+  if(!inRect(spotifyCard.bounds,touchX,touchY))return false;
 
-  int by=spotifyCard.r.y+spotifyCard.titleH+spotifyCard.infoH;
-  if(y<by)return false;
+  int buttonsTop=spotifyCard.bounds.y+spotifyCard.titleHeight+spotifyCard.infoHeight;
+  if(touchY<buttonsTop)return false;
 
-  int cw=spotifyCard.r.w/3;
-  int i=constrain((x-spotifyCard.r.x)/cw,0,2);
+  int cellWidth=spotifyCard.bounds.w/3;
+  int pressedIndex=constrain((touchX-spotifyCard.bounds.x)/cellWidth,0,2);
 
-  display.startWrite();drawSpotify(i);display.endWrite();
+  display.startWrite();drawSpotify(pressedIndex);display.endWrite();
 
-  const char* service = i==0 ? "media_previous_track" :
-                        i==1 ? "media_play_pause" :
+  const char* service = pressedIndex==0 ? "media_previous_track" :
+                        pressedIndex==1 ? "media_play_pause" :
                                "media_next_track";
-  const char* label = i==0 ? "Spotify : precedent..." :
-                      i==1 ? "Spotify : pause/lecture..." :
+  const char* label = pressedIndex==0 ? "Spotify : précedent..." :
+                      pressedIndex==1 ? "Spotify : pause/lecture..." :
                              "Spotify : suivant...";
-  status(label);
+  showStatus(label);
 
   bool ok=haCall("media_player",service,ENTITY_SPOTIFY);
-  status(ok?"OK":"Erreur commande HA");
+  showStatus(ok?"OK":"Erreur commande HA");
   delay(300);
 
-  // Pas de rafraichissement périodique : on relit uniquement après une commande.
+  // Pas de rafraîchissement périodique : on relit uniquement après une commande.
   refreshSpotify();
   display.startWrite();drawSpotify();display.endWrite();
-  status(page==1?"Page 1/2":"Page 2/2");
+  showStatus(currentPage==1?"Page 1/2":"Page 2/2");
   return true;
 }
 
-bool touchWifi(int x,int y){
-  if(hasVoucher||!inRect(wifiCard.r,x,y))return false;
-  int by=wifiCard.r.y+wifiCard.titleH;
-  if(y<by)return false;
+bool touchWifi(int touchX,int touchY){
+  if(hasVoucher||!inRect(wifiCard.bounds,touchX,touchY))return false;
+  int buttonTop=wifiCard.bounds.y+wifiCard.titleHeight;
+  if(touchY<buttonTop)return false;
   display.startWrite();drawWifi(true);display.endWrite();
-  status("Creation voucher Wifi...");
+  showStatus("Creation voucher Wi-Fi...");
   bool ok=haCall("input_button","press",ENTITY_WIFI_BUTTON);
-  if(ok){delay(2000);refreshVoucher();status(hasVoucher?("Code : "+voucherCode).c_str():"Code introuvable");}
-  else status("Erreur commande HA");
+  if(ok){delay(2000);refreshVoucher();showStatus(hasVoucher?("Code : "+voucherCode).c_str():"Code introuvable");}
+  else showStatus("Erreur commande HA");
   drawPage();delay(300);return true;
 }
 
@@ -812,28 +801,28 @@ bool touchWifi(int x,int y){
 void setup(){
   Serial.begin(115200);
   display.loadFont(SpaceMono26);
-  pinMode(G37,INPUT_PULLUP); pinMode(G39,INPUT_PULLUP);
+  pinMode(PIN_BUTTON_PREV,INPUT_PULLUP); pinMode(PIN_BUTTON_NEXT,INPUT_PULLUP);
   display.begin();display.setRotation(0);display.setEpdMode(epd_mode_t::epd_fastest);
   setupLayout();connectWifi();refreshClimate();
-  for(auto a:actions)refreshAction(*a);
-  for(auto &c:covers)refreshCover(c);
+  for(auto actionCard:actionCards)refreshAction(*actionCard);
+  for(auto &coverCard:covers)refreshCover(coverCard);
   refreshVoucher();refreshSpotify();resetActivityTimer();drawPage();
 }
 
 void loop(){
-  if(DEEPSLEEP_ENABLED&&millis()-lastActivity>=DEEPSLEEP_TIMEOUT_MS)enterDeepSleep();
+  if(DEEPSLEEP_ENABLED&&millis()-lastActivityTime>=DEEPSLEEP_TIMEOUT_MS)enterDeepSleep();
   if(pageButtons())return;
 
-  lgfx::touch_point_t tp;
-  if(display.getTouch(&tp)){
+  lgfx::touch_point_t touchPoint;
+  if(display.getTouch(&touchPoint)){
     resetActivityTimer();
-    if(page==1){
-      for(auto a:actions)if(touchAction(*a,tp.x,tp.y))return;
-      if(touchSpotify(tp.x,tp.y))return;
-      if(touchClimate(tp.x,tp.y))return;
+    if(currentPage==1){
+      for(auto actionCard:actionCards)if(touchAction(*actionCard,touchPoint.x,touchPoint.y))return;
+      if(touchSpotify(touchPoint.x,touchPoint.y))return;
+      if(touchClimate(touchPoint.x,touchPoint.y))return;
     }else{
-      if(touchCovers(tp.x,tp.y))return;
-      touchWifi(tp.x,tp.y);
+      if(touchCovers(touchPoint.x,touchPoint.y))return;
+      touchWifi(touchPoint.x,touchPoint.y);
     }
   }
   delay(50);
