@@ -34,6 +34,8 @@ const char* ENTITY_TEMP     = "sensor.salon_temperature";
 const char* ENTITY_HUMIDITY = "sensor.salon_humidite";   // capteur d'humidité séparé
 const char* ENTITY_OUTDOOR_TEMP     = "sensor.merignac_temperature";
 const char* ENTITY_OUTDOOR_HUMIDITY = "sensor.merignac_humidity";
+const char* ENTITY_BEDROOM_TEMP     = "sensor.alpstuga_air_quality_monitor_temperature";
+const char* ENTITY_BEDROOM_HUMIDITY = "sensor.alpstuga_air_quality_monitor_humidite";
 const char* ENTITY_WIFI_BUTTON = "input_button.creer_voucher";
 const char* ENTITY_WIFI_SENSOR = "sensor.liste_hotspot_vouchers";
 
@@ -117,13 +119,15 @@ const char* HVAC_MODES[3]  = {"heat","cool","off"};
 
 struct ClimateCard {
   Rect bounds;
-  int titleHeight,modeHeight,tempHeight,indoorInfoHeight,outdoorInfoHeight,cellWidth;
+  int titleHeight,modeHeight,tempHeight,indoorInfoHeight,bedroomInfoHeight,outdoorInfoHeight,cellWidth;
 } climate;
 String hvacMode="off";
 bool hasTarget=false, hasCurrent=false, hasHumidity=false;
 float targetTemp=20.0f, currentTemp=0, currentHumidity=0;
 bool hasOutdoorTemp=false, hasOutdoorHumidity=false;
 float outdoorTemp=0, outdoorHumidity=0;
+bool hasBedroomTemp=false, hasBedroomHumidity=false;
+float bedroomTemp=0, bedroomHumidity=0;
 
 // ---------- Wi-Fi ----------
 struct WifiCard { Rect bounds; int titleHeight,buttonHeight,passwordHeight,codeHeight; } wifiCard;
@@ -162,23 +166,40 @@ void drawPauseIcon(int centerX,int centerY,int size,uint32_t color){
   display.fillRect(centerX+size/2-barWidth,centerY-size,barWidth,2*size,color);
 }
 
+// Trace une ligne "épaisse" en dessinant plusieurs lignes parallèles
+// décalées perpendiculairement à la direction du segment.
+// Fonctionne quel que soit l'angle (contrairement à un simple +1 en X).
+void drawThickLine(int x0,int y0,int x1,int y1,uint32_t color,int thickness){
+  float dx=x1-x0, dy=y1-y0;
+  float len=sqrtf(dx*dx+dy*dy);
+  if(len<0.001f){
+    display.drawLine(x0,y0,x1,y1,color);
+    return;
+  }
+  float px=-dy/len, py=dx/len;   // vecteur perpendiculaire unitaire
+  int half=thickness/2;
+  for(int offset=-half; offset<=thickness-half-1; offset++){
+    int ox=(int)roundf(px*offset);
+    int oy=(int)roundf(py*offset);
+    display.drawLine(x0+ox,y0+oy,x1+ox,y1+oy,color);
+  }
+}
+
 // Ligne ondulée (volute de chaleur), tracée par segments successifs.
-// topY/bottomY : étendue verticale ; amplitude : amplitude horizontale de l'ondulation.
 void drawHeatWaveSegment(int centerX,int topY,int bottomY,int amplitude,uint32_t color){
-  const int SEGMENT_COUNT=12;
+  const int SEGMENT_COUNT=8;
+  const int THICKNESS=3;   // épaisseur du trait, ajuster au besoin
   int previousX=centerX,previousY=topY;
   for(int i=1;i<=SEGMENT_COUNT;i++){
     float progress=(float)i/SEGMENT_COUNT;
-    int x=centerX+(int)(amplitude*sinf(progress*6.9f));      // ~2 ondulations sur la hauteur
+    int x=centerX+(int)(amplitude*sinf(progress*6.9f));
     int y=topY+(int)(progress*(bottomY-topY));
-    display.drawLine(previousX,previousY,x,y,color);
-    display.drawLine(previousX+1,previousY,x+1,y,color);     // épaississement
+    drawThickLine(previousX,previousY,x,y,color,THICKNESS);
     previousX=x;previousY=y;
   }
 }
 
-// Icône chauffage : basée sur le pictogramme "surface chaude"
-// (barre horizontale + 3 volutes de chaleur qui s'en élèvent).
+// Icône chauffage : inchangée, la barre est déjà pleine (fillRect).
 void drawHeatingIcon(int centerX,int centerY,int size,uint32_t color){
   int barY=centerY+(int)(size*0.85f);
   display.fillRect(centerX-(int)(size*0.8f),barY,(int)(size*1.6f),(int)(size*0.22f),color);
@@ -191,17 +212,18 @@ void drawHeatingIcon(int centerX,int centerY,int size,uint32_t color){
 
 // Icône clim : flocon hexagonal (3 axes) avec ramifications sur chaque branche.
 void drawSnowflakeIcon(int centerX,int centerY,int size,uint32_t color){
+  const int THICKNESS=3;
   for(int axis=0;axis<3;axis++){
     float angle=axis*PI/3.0f, dx=cosf(angle), dy=sinf(angle);
-    display.drawLine(centerX-dx*size,   centerY-dy*size,   centerX+dx*size,   centerY+dy*size,   color);
-    display.drawLine(centerX-dx*size,   centerY-dy*size+1, centerX+dx*size,   centerY+dy*size+1, color);
+    drawThickLine(centerX-dx*size, centerY-dy*size, centerX+dx*size, centerY+dy*size, color, THICKNESS);
     for(int side=-1;side<=1;side+=2){
       float branchX=centerX+dx*size*0.55f*side, branchY=centerY+dy*size*0.55f*side;
       for(int direction=-1;direction<=1;direction+=2){
         float branchAngle=angle+direction*(PI/3.0f);
-        display.drawLine(branchX,branchY,
-                          branchX+cosf(branchAngle)*size*0.32f*side,
-                          branchY+sinf(branchAngle)*size*0.32f*side,color);
+        drawThickLine(branchX,branchY,
+          branchX+cosf(branchAngle)*size*0.32f*side,
+          branchY+sinf(branchAngle)*size*0.32f*side,
+          color,THICKNESS);
       }
     }
   }
@@ -300,6 +322,25 @@ void drawCovers(int pressedSelector=-1,int pressedButton=-1){
   drawThickRoundedRect(coversBlock.bounds.x,coversBlock.bounds.y,coversBlock.bounds.w,coversBlock.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
 
+// Aligne les colonnes (nom / température / humidité) sur une position X fixe,
+// indépendamment de la longueur du label ("Salon" vs "Extérieur"), pour que
+// les valeurs de température et d'humidité restent alignées entre les lignes.
+void drawClimateInfoRow(int y,int height,const char* label,const String& tempLabel,const String& humidityLabel){
+  constexpr float LABEL_X_RATIO = 0.03f;  // marge gauche
+  constexpr float TEMP_X_RATIO  = 0.408f; // colonne température
+  constexpr float HUM_X_RATIO   = 0.788f; // colonne humidité
+
+  int centerY=y+height/2;
+  display.setTextColor(TFT_BLACK,TFT_WHITE);
+  display.setTextSize(1);
+
+  display.setTextDatum(middle_left); // datum local : les 3 colonnes sont alignées à gauche de leur X
+  display.drawString(label, climate.bounds.x+(int)(climate.bounds.w*LABEL_X_RATIO), centerY);
+  display.drawString(tempLabel.c_str(), climate.bounds.x+(int)(climate.bounds.w*TEMP_X_RATIO), centerY);
+  display.drawString(humidityLabel.c_str(), climate.bounds.x+(int)(climate.bounds.w*HUM_X_RATIO), centerY);
+  display.setTextDatum(middle_center); // on remet le datum par défaut utilisé partout ailleurs
+}
+
 // pressedModeIndex : bouton de mode en cours d'appui (-1 = aucun)
 // pressedTempIndex : bouton -/+ en cours d'appui (-1 = aucun)
 void drawClimate(int pressedModeIndex=-1,int pressedTempIndex=-1){
@@ -339,18 +380,21 @@ void drawClimate(int pressedModeIndex=-1,int pressedTempIndex=-1){
   currentY+=climate.tempHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
   // ---- ligne info : température actuelle + humidité (salon) ----
-  String indoorTempLabel=hasCurrent?String(currentTemp,1)+"°C":"--";
-  String indoorHumidityLabel=hasHumidity?String(currentHumidity,0)+"%":"--";
-  display.setTextColor(TFT_BLACK,TFT_WHITE); display.setTextSize(1);
-  display.drawString(("Salon "+indoorTempLabel+" "+indoorHumidityLabel).c_str(),
-                     climate.bounds.x+climate.bounds.w/2,currentY+climate.indoorInfoHeight/2);
+  String indoorTempLabel=hasCurrent?String(currentTemp,1)+"°C":"";
+  String indoorHumidityLabel=hasHumidity?String(currentHumidity,0)+"%":"";
+  drawClimateInfoRow(currentY,climate.indoorInfoHeight,"Salon",indoorTempLabel,indoorHumidityLabel);
   currentY+=climate.indoorInfoHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
 
+  // ---- ligne info : température/humidité chambre ----
+  String bedroomTempLabel=hasBedroomTemp?String(bedroomTemp,1)+"°C":"";
+  String bedroomHumidityLabel=hasBedroomHumidity?String(bedroomHumidity,0)+"%":"";
+  drawClimateInfoRow(currentY,climate.bedroomInfoHeight,"Chambre",bedroomTempLabel,bedroomHumidityLabel);
+  currentY+=climate.bedroomInfoHeight; drawHorizontalLine(climate.bounds.x,currentY,climate.bounds.w,TFT_BLACK,LINE_THICKNESS);
+
   // ---- ligne info : température/humidité extérieure ----
-  String outdoorTempLabel=hasOutdoorTemp?String(outdoorTemp,1)+"°C":"--";
-  String outdoorHumidityLabel=hasOutdoorHumidity?String(outdoorHumidity,0)+"%":"--";
-  display.drawString(("Exter "+outdoorTempLabel+" "+outdoorHumidityLabel).c_str(),
-                     climate.bounds.x+climate.bounds.w/2,currentY+climate.outdoorInfoHeight/2);
+  String outdoorTempLabel=hasOutdoorTemp?String(outdoorTemp,1)+"°C":"";
+  String outdoorHumidityLabel=hasOutdoorHumidity?String(outdoorHumidity,0)+"%":"";
+  drawClimateInfoRow(currentY,climate.outdoorInfoHeight,"Extérieur",outdoorTempLabel,outdoorHumidityLabel);
 
   drawThickRoundedRect(climate.bounds.x,climate.bounds.y,climate.bounds.w,climate.bounds.h,CORNER_RADIUS,TFT_BLACK,BORDER_THICKNESS);
 }
@@ -368,17 +412,25 @@ void drawSpotify(int pressedIndex=-1){
 
   int lineHeight=spotifyCard.infoHeight/2;
 
-  display.drawString(
-    trackTitle.c_str(),
-    spotifyCard.bounds.x+spotifyCard.bounds.w/2,
-    currentY+lineHeight/2
-  );
-
   if(trackArtist.length()){
+    // Titre + artiste : chacun centré dans sa moitié du bloc.
+    display.drawString(
+      trackTitle.c_str(),
+      spotifyCard.bounds.x+spotifyCard.bounds.w/2,
+      currentY+lineHeight/2
+    );
     display.drawString(
       trackArtist.c_str(),
       spotifyCard.bounds.x+spotifyCard.bounds.w/2,
       currentY+lineHeight+lineHeight/2
+    );
+  }else{
+    // Pas d'artiste (ou pas de lecture en cours) : le titre seul est centré
+    // sur toute la hauteur du bloc, pour éviter un grand espace vide en dessous.
+    display.drawString(
+      trackTitle.c_str(),
+      spotifyCard.bounds.x+spotifyCard.bounds.w/2,
+      currentY+spotifyCard.infoHeight/2
     );
   }
 
@@ -469,11 +521,12 @@ void setupLayout(){
   climate.modeHeight=LINE_MEDIUM;
   climate.tempHeight=LINE_MEDIUM;
   climate.indoorInfoHeight=LINE_SMALL;
+  climate.bedroomInfoHeight=LINE_SMALL;
   climate.outdoorInfoHeight=LINE_SMALL;
   climate.cellWidth=cardWidth/3;
 
   climate.bounds={marginX,currentY,cardWidth,
-    climate.titleHeight+climate.modeHeight+climate.tempHeight+climate.indoorInfoHeight+climate.outdoorInfoHeight};
+    climate.titleHeight+climate.modeHeight+climate.tempHeight+climate.indoorInfoHeight+climate.bedroomInfoHeight+climate.outdoorInfoHeight};
 
   // ---------- Page 2 ----------
   // Volets en premier, puis Hotspot Wi-Fi.
@@ -560,6 +613,14 @@ void refreshClimate(){
   if(haState(ENTITY_OUTDOOR_HUMIDITY,outdoorHumidityDoc)){
     const char* v=outdoorHumidityDoc["state"]; if(v){outdoorHumidity=atof(v);hasOutdoorHumidity=true;}
   }
+  DynamicJsonDocument bedroomTempDoc(1024);
+  if(haState(ENTITY_BEDROOM_TEMP,bedroomTempDoc)){
+    const char* v=bedroomTempDoc["state"]; if(v){bedroomTemp=atof(v);hasBedroomTemp=true;}
+  }
+  DynamicJsonDocument bedroomHumidityDoc(1024);
+  if(haState(ENTITY_BEDROOM_HUMIDITY,bedroomHumidityDoc)){
+    const char* v=bedroomHumidityDoc["state"]; if(v){bedroomHumidity=atof(v);hasBedroomHumidity=true;}
+  }
 }
 
 void refreshSpotify(){
@@ -575,6 +636,10 @@ void refreshSpotify(){
   spotifyState=spotifyDoc["state"].as<String>();
   spotifyTitle=spotifyDoc["attributes"]["media_title"].as<String>();
   spotifyArtist=spotifyDoc["attributes"]["media_artist"].as<String>();
+  // Certaines métadonnées Spotify/HA contiennent des espaces en début/fin de
+  // chaîne : sans trim(), ils faussent le calcul de centrage horizontal.
+  spotifyTitle.trim();
+  spotifyArtist.trim();
   hasSpotify=(spotifyTitle.length()>0 || spotifyArtist.length()>0);
 }
 
@@ -622,8 +687,9 @@ bool haTemplate(const String& templateStr,DynamicJsonDocument& responseDoc){
 }
 
 // Récupère en un seul appel HTTP tout ce qu'il faut pour dessiner la page 1 au
-// démarrage : climatisation, température/humidité intérieure et extérieure,
-// état des 3 "Modes", et Spotify. Remplace ~9 requêtes séquentielles par 1 seule.
+// démarrage : climatisation, température/humidité intérieure, chambre et
+// extérieure, état des 3 "Modes", et Spotify. Remplace ~11 requêtes
+// séquentielles par 1 seule.
 // NB: si tu modifies les entités ci-dessous, vérifie le rendu du template dans
 // Home Assistant (Outils de développement > Modèle) avant de faire confiance au résultat.
 void refreshStartupData(){
@@ -635,6 +701,8 @@ void refreshStartupData(){
     + "\"indoor_humidity\":{{ states('" + ENTITY_HUMIDITY + "') | float(0) }},"
     + "\"outdoor_temp\":{{ states('" + ENTITY_OUTDOOR_TEMP + "') | float(0) }},"
     + "\"outdoor_humidity\":{{ states('" + ENTITY_OUTDOOR_HUMIDITY + "') | float(0) }},"
+    + "\"bedroom_temp\":{{ states('" + ENTITY_BEDROOM_TEMP + "') | float(0) }},"
+    + "\"bedroom_humidity\":{{ states('" + ENTITY_BEDROOM_HUMIDITY + "') | float(0) }},"
     + "\"bus_on\":{{ (states('" + modes.entity[0] + "')=='on') | tojson }},"
     + "\"absence_on\":{{ (states('" + modes.entity[1] + "')=='on') | tojson }},"
     + "\"sunshield_on\":{{ (states('" + modes.entity[2] + "')=='on') | tojson }},"
@@ -659,6 +727,8 @@ void refreshStartupData(){
   currentHumidity=startupDoc["indoor_humidity"].as<float>(); hasHumidity=true;
   outdoorTemp=startupDoc["outdoor_temp"].as<float>(); hasOutdoorTemp=true;
   outdoorHumidity=startupDoc["outdoor_humidity"].as<float>(); hasOutdoorHumidity=true;
+  bedroomTemp=startupDoc["bedroom_temp"].as<float>(); hasBedroomTemp=true;
+  bedroomHumidity=startupDoc["bedroom_humidity"].as<float>(); hasBedroomHumidity=true;
 
   modes.active[0]=startupDoc["bus_on"].as<bool>();
   modes.active[1]=startupDoc["absence_on"].as<bool>();
@@ -667,6 +737,8 @@ void refreshStartupData(){
   spotifyState=startupDoc["spotify_state"].as<String>();
   spotifyTitle=startupDoc["spotify_title"].as<String>();
   spotifyArtist=startupDoc["spotify_artist"].as<String>();
+  spotifyTitle.trim();
+  spotifyArtist.trim();
   hasSpotify=(spotifyTitle.length()>0 || spotifyArtist.length()>0);
 }
 
@@ -900,7 +972,7 @@ void setup(){
   connectWifi();
 
   // Un seul appel HTTP groupé pour toute la page 1 (climatisation, intérieur/
-  // extérieur, modes, Spotify), au lieu d'une dizaine de requêtes séquentielles.
+  // chambre/extérieur, modes, Spotify), au lieu d'une dizaine de requêtes séquentielles.
   refreshStartupData();
 
   // Volets et voucher Wi-Fi (page 2) : chargés seulement au premier affichage
